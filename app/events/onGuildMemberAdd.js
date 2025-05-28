@@ -24,7 +24,8 @@ const COMMUNITY_STATUS = {
  */
 const rolesMap = new Map();
 rolesMap.set("RECRUITER", "Recruiter");
-rolesMap.set("BOT", "House Valier Bot");
+rolesMap.set("BOT", "Wraiven Bot");
+
 
 /********************************************
  * HELPER FUNCTIONS
@@ -100,7 +101,7 @@ function buildProcessingChannelPermissions(member, guild) {
   );
 
   // The user gets full access, @everyone is denied, special roles get partial access.
-  return [
+  const overwrites = [
     {
       id: guild.id, // @everyone
       deny: [PermissionsBitField.Flags.ViewChannel],
@@ -113,15 +114,21 @@ function buildProcessingChannelPermissions(member, guild) {
         PermissionsBitField.Flags.ReadMessageHistory,
       ],
     },
-    {
-      id: recruiterRole?.id,
+  ];
+
+  if (recruiterRole && recruiterRole.id) {
+    overwrites.push({
+      id: recruiterRole.id,
       allow: [
         PermissionsBitField.Flags.ViewChannel,
         PermissionsBitField.Flags.SendMessages,
       ],
-    },
-    {
-      id: botRole?.id,
+    });
+  }
+
+  if (botRole && botRole.id) {
+    overwrites.push({
+      id: botRole.id,
       allow: [
         PermissionsBitField.Flags.ViewChannel,
         PermissionsBitField.Flags.SendMessages,
@@ -130,12 +137,13 @@ function buildProcessingChannelPermissions(member, guild) {
         PermissionsBitField.Flags.ManageChannels,
         PermissionsBitField.Flags.ManageRoles,
       ],
-    },
-  ];
+    });
+  }
+  return overwrites;
 }
 
 /**
- * Ensures the user’s "processing" channel exists and permissions are correct.
+ * Ensures the user's "processing" channel exists and permissions are correct.
  * Returns the channel. Creates it if needed; updates perms if it exists.
  */
 async function ensureUserProcessingChannel(
@@ -296,7 +304,7 @@ async function processNewUser(member, database) {
   const channelLink = `https://discord.com/channels/${guild.id}/${channel.id}`;
   try {
     await member.send(
-      `Hello **${member.user.username}**, welcome to House Valier!\n` +
+      `Hello **${member.user.username}**, welcome to Wraiven!\n` +
         `Your private channel is ready: ${channelLink}`
     );
   } catch (dmError) {
