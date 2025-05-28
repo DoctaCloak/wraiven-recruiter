@@ -13,27 +13,26 @@ const commands = [];
 
 const ROOT_DIR = process.cwd();
 
-// Grab all the command folders from the commands directory you created earlier
-const foldersPath = path.join(ROOT_DIR, "app/commands");
-const commandFolders = fs.readdirSync(foldersPath);
+// Path to the commands directory
+const commandsPath = path.join(ROOT_DIR, "app/commands");
+const commandFiles = fs
+  .readdirSync(commandsPath)
+  .filter((file) => file.endsWith(".js"));
 
-for (const folder of commandFolders) {
-  // Grab all the command files from the commands directory you created earlier
-  const commandsPath = path.join(foldersPath, folder);
-  const commandFiles = fs
-    .readdirSync(commandsPath)
-    .filter((file) => file.endsWith(".js"));
-  // Grab the SlashCommandBuilder#toJSON() output of each command's data for deployment
-  for (const file of commandFiles) {
-    const filePath = path.join(commandsPath, file);
-    const { default: command } = await import(`${filePath}`);
-    if ("data" in command && "execute" in command) {
-      commands.push(command.data.toJSON());
-    } else {
-      console.log(
-        `[WARNING] The command at ${filePath} is missing a required "data" or "execute" property.`
-      );
-    }
+// Grab the SlashCommandBuilder#toJSON() output of each command's data for deployment
+for (const file of commandFiles) {
+  const filePath = path.join(commandsPath, file);
+  // Dynamically import the command module
+  // Ensure your Node version supports top-level await or run this in an async function if not.
+  const commandModule = await import(`file://${filePath}`);
+  const command = commandModule.default; // Adjust if your command modules export differently
+
+  if (command && "data" in command && "execute" in command) {
+    commands.push(command.data.toJSON());
+  } else {
+    console.log(
+      `[WARNING] The command at ${filePath} is missing a required "data" or "execute" property.`
+    );
   }
 }
 
