@@ -1,5 +1,7 @@
 import { Events, PermissionsBitField } from "discord.js";
 import { getAccountRestrictionEmbed } from "./utils/onGuildMemberAdd.js";
+import { processUserMessageWithLLM } from "../utils/llm_utils.js";
+import { initiateVouchProcess } from "../utils/discord_actions.js";
 
 /********************************************
  * CONSTANTS & CONFIG
@@ -304,7 +306,8 @@ async function processNewUser(member, database) {
   const channelLink = `https://discord.com/channels/${guild.id}/${channel.id}`;
   try {
     await member.send(
-      `Hello **${member.user.username}**, welcome to Wraiven!\n` +
+      `Hello **${member.user.username}**, welcome to Wraiven!
+` +
         `Your private channel is ready: ${channelLink}`
     );
   } catch (dmError) {
@@ -318,6 +321,193 @@ async function processNewUser(member, database) {
   await channel.send(
     "What is your purpose for joining the House Valier Discord channel?"
   );
+
+  // Collect the user's first message in response
+  const filter = (m) => m.author.id === member.id;
+  const collector = channel.createMessageCollector({
+    filter,
+    max: 1, // Collect only one message for this initial interaction
+    time: 5 * 60 * 1000, // 5 minutes
+  });
+
+  collector.on("collect", async (message) => {
+    console.log(
+      `Collected response from ${member.user.tag}: "${message.content}"`
+    );
+
+    // 1. Store the user's message in messageHistory
+    try {
+      await recruitmentCollection.updateOne(
+        { userId: member.user.id },
+        {
+          $push: {
+            messageHistory: {
+              author: "user",
+              content: message.content,
+              timestamp: message.createdTimestamp,
+            },
+          },
+          $set: { lastActivityAt: Date.now() } // Update last activity timestamp
+        }
+      );
+    } catch (dbError) {
+      console.error(
+        `Error updating message history with user message for ${member.user.tag}:`,
+        dbError
+      );
+      // Potentially send an error message or alert, but continue for now
+    }
+
+    // 2. Fetch updated conversation history for the LLM
+    let conversationHistory = [];
+    try {
+      const userData = await recruitmentCollection.findOne({ userId: member.user.id });
+      if (userData && userData.messageHistory) {
+        conversationHistory = userData.messageHistory.map((histMessage) => ({
+          author: histMessage.author, // Assumes DB stores 'user' or 'bot'
+          content: histMessage.content,
+        }));
+      }
+    } catch (dbError) {
+      console.error(
+        `Error fetching conversation history for ${member.user.tag}:`,
+        dbError
+      );
+      // LLM will proceed without history if this fails
+    }
+
+    // 3. Call the LLM (mock for now)
+    const llmResponse = await processUserMessageWithLLM(
+      message.content,
+      member.user.id,
+      conversationHistory
+    );
+    console.log("[RecruiterApp] LLM Response Received:", JSON.stringify(llmResponse, null, 2));
+
+    // 4. Bot acts based on LLM output
+    let botResponseMessageContent;
+    let performedComplexAction = false; // Flag to see if a specific intent handler took over
+
+    if (llmResponse && llmResponse.intent) {
+      switch (llmResponse.intent) {
+        case "COMMUNITY_INTEREST_VOUCH":
+          console.log(`[RecruiterApp] Intent: COMMUNITY_INTEREST_VOUCH, Entities:`, llmResponse.entities);
+          botResponseMessageContent = llmResponse.suggested_bot_response || "Thanks for your interest in the community and mentioning a vouch!";
+          await channel.send(botResponseMessageContent);
+          
+          if (llmResponse.entities && llmResponse.entities.vouch_person_name) {
+            const voucherName = llmResponse.entities.vouch_person_name;
+            const guild = member.guild; // Get guild from member
+            const voucherMember = guild.members.cache.find(m => 
+              m.user.username.toLowerCase() === voucherName.toLowerCase() || 
+              m.displayName.toLowerCase() === voucherName.toLowerCase() ||
+              m.id === voucherName.replace(/<@!?(\d+)>/g, '$1') // Extract ID from mention
+            );
+
+            if (voucherMember) {
+              console.log(`[RecruiterApp] VOUCH: Found potential voucher: ${voucherMember.user.tag}`);
+              // Actually call the vouch process
+              await initiateVouchProcess(member, voucherMember, channel, llmResponse, recruitmentCollection);
+              // The initiateVouchProcess function will handle further user communication for this path.
+              // So, we might not need to set botResponseMessageContent here or log it again, 
+              // as that function handles its own interactions and DB logging for vouch specific messages.
+              // For simplicity, we'll clear it to prevent double logging of the initial LLM response.
+              botResponseMessageContent = null; 
+            } else {
+              console.log(`[RecruiterApp] VOUCH: Could not find voucher member by name/ID: ${voucherName}`);
+              botResponseMessageContent = `I see you mentioned ${voucherName}, but I couldn't find them in the server. Could you please @mention them directly?`;
+              await channel.send(botResponseMessageContent);
+            }
+          } else {
+            botResponseMessageContent = "You mentioned a vouch, but I couldn't quite catch who that was. Could you please @mention them so I can connect you?";
+            await channel.send(botResponseMessageContent);
+          }
+          performedComplexAction = true;
+          break;
+
+        case "GUILD_APPLICATION_INTEREST":
+          console.log(`[RecruiterApp] Intent: GUILD_APPLICATION_INTEREST, Entities:`, llmResponse.entities);
+          botResponseMessageContent = llmResponse.suggested_bot_response || "Thanks for your interest in applying! Let me get you some information.";
+          // Future: guide through application questions or link to application form.
+          await channel.send(botResponseMessageContent);
+          performedComplexAction = true; // Mark that we handled this intent specifically
+          break;
+
+        case "GENERAL_QUESTION":
+          console.log(`[RecruiterApp] Intent: GENERAL_QUESTION, Entities:`, llmResponse.entities);
+          botResponseMessageContent = llmResponse.suggested_bot_response || "That's a good question!";
+          // Future: try to answer from a knowledge base or use LLM to generate answer.
+          await channel.send(botResponseMessageContent);
+          performedComplexAction = true;
+          break;
+
+        // Add more cases for other intents as needed
+        // case "SOCIAL_GREETING":
+        // case "UNCLEAR_INTENT":
+        // case "OTHER":
+
+        default:
+          console.log(`[RecruiterApp] Intent: ${llmResponse.intent} (using default response)`);
+          botResponseMessageContent = llmResponse.suggested_bot_response;
+          if (!botResponseMessageContent) {
+            console.warn(
+              "[RecruiterApp] No suggested_bot_response from LLM or LLM failed for default case."
+            );
+            botResponseMessageContent =
+              "I'm having a little trouble understanding that. A guild officer will be with you shortly to help.";
+          }
+          await channel.send(botResponseMessageContent);
+          break;
+      }
+    } else {
+      console.warn(
+        "[RecruiterApp] No intent from LLM or LLM response was malformed."
+      );
+      botResponseMessageContent =
+        "I'm currently having some trouble processing requests. A guild officer will be with you shortly.";
+      await channel.send(botResponseMessageContent);
+    }
+
+    // 5. Store bot's response in messageHistory, only if a complex action didn't already send one
+    //    OR if a complex action sent one, it should also handle its own history logging.
+    //    For now, the switch cases send messages, so we log the `botResponseMessageContent` used.
+    if (botResponseMessageContent) { // Ensure there is a message to log
+      try {
+        await recruitmentCollection.updateOne(
+          { userId: member.user.id },
+          {
+            $push: {
+              messageHistory: {
+                author: "bot",
+                content: botResponseMessageContent,
+                timestamp: Date.now(),
+              },
+            },
+            $set: { lastActivityAt: Date.now() } // Update last activity timestamp
+          }
+        );
+      } catch (dbError) {
+        console.error(
+          `Error updating message history with bot response for ${member.user.tag}:`,
+          dbError
+        );
+      }
+    }
+  });
+
+  collector.on("end", (collected, reason) => {
+    if (reason === "time" && collected.size === 0) { // Ensure no message was collected before timeout message
+      console.log(
+        `User ${member.user.tag} did not respond within the time limit.`
+      );
+      // Optionally, send a follow-up message or alert a recruiter
+      channel
+        .send(
+          "It looks like you might be busy. Feel free to respond when you're ready, or a recruiter will check in with you later."
+        )
+        .catch(console.error);
+    }
+  });
 }
 
 /********************************************
