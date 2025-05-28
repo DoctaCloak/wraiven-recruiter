@@ -97,25 +97,24 @@ async function main() {
  *     LOAD COMMANDS
  *************************/
 async function loadCommands() {
-  const COMMANDS_FOLDER = path.join(ROOT_DIR, "app/commands");
-  const commandFolders = fs.readdirSync(COMMANDS_FOLDER);
+  const COMMANDS_PATH = path.join(ROOT_DIR, "app/commands");
+  const commandFiles = fs.readdirSync(COMMANDS_PATH).filter((file) => file.endsWith(".js"));
 
-  for (const commandSubfolder of commandFolders) {
-    const commandsPath = path.join(COMMANDS_FOLDER, commandSubfolder);
-    const commandFiles = fs
-      .readdirSync(commandsPath)
-      .filter((file) => file.endsWith(".js"));
-
-    for (const file of commandFiles) {
-      const filePath = path.join(commandsPath, file);
-      const { default: command } = await import(`file://${filePath}`);
+  for (const file of commandFiles) {
+    const filePath = path.join(COMMANDS_PATH, file);
+    try {
+      const commandModule = await import(`file://${filePath}`);
+      const command = commandModule.default;
       if (command?.data && command?.execute) {
         client.commands.set(command.data.name, command);
+        // console.log(`Loaded command: ${command.data.name}`); // Optional: for debugging
       } else {
         console.warn(
-          `[WARNING] The command at ${filePath} is missing "data" or "execute".`
+          `[WARNING] The command at ${filePath} is missing a required "data" or "execute" property.`
         );
       }
+    } catch (error) {
+      console.error(`[ERROR] Failed to load command at ${filePath}:`, error);
     }
   }
 }
