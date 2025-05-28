@@ -14,6 +14,8 @@ const { OPENAI_API_KEY } = process.env;
 if (!OPENAI_API_KEY) {
   console.error("OPENAI_API_KEY is required");
   process.exit(1);
+} else {
+    console.log("OPENAI_API_KEY is set");
 }
 
 const openai = new OpenAI({
