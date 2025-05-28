@@ -1,6 +1,6 @@
-const { SlashCommandBuilder, PermissionFlagsBits, ChannelType } = require('discord.js');
+import { SlashCommandBuilder, PermissionFlagsBits, ChannelType } from 'discord.js';
 
-module.exports = {
+export default {
     data: new SlashCommandBuilder()
         .setName('setup-guild-recruitment')
         .setDescription('Configures guild recruitment channels and roles. (Admin/Lead Officer only)')
