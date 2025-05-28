@@ -6,12 +6,18 @@
  */
 
 import OpenAI from 'openai';
-import dotenv from 'dotenv';
+import { config } from 'dotenv';
 
-dotenv.config({ path: '../../.env' }); // Load from root .env file
+config();
+const { OPENAI_API_KEY } = process.env;
+
+if (!OPENAI_API_KEY) {
+  console.error("OPENAI_API_KEY is required");
+  process.exit(1);
+}
 
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+  apiKey: OPENAI_API_KEY,
 });
 
 // Define the structure we expect the LLM to return
