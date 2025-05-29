@@ -41,10 +41,22 @@ export default function onMessageCreate(client, database) {
     const messageHistoryCollection = database.collection("messageHistory");
     const userId = message.author.id;
 
-    const userData = await recruitmentCollection.findOne({ userId: userId, channelId: message.channel.id });
+    let userData = await recruitmentCollection.findOne({ userId: userId });
+
+    if (userData && userData.channelId !== message.channel.id) {
+        console.warn(`[onMessageCreate] User ${userId} found, but DB channelId (${userData.channelId}) does not match message channelId (${message.channel.id}). Attempting to update DB.`);
+        // Optionally, update the channelId in the DB if this is considered the new primary processing channel.
+        // This could happen if an old channel was deleted and a new one (somehow) created without updating the main user doc.
+        // For now, let's treat it as a mismatch and not proceed with rehydration for this specific message to be safe.
+        // Or, if confident, one could update: 
+        // await recruitmentCollection.updateOne({ userId: userId }, { $set: { channelId: message.channel.id } });
+        // userData.channelId = message.channel.id; // Reflect change locally if updated
+        // For safety, let's log and prevent rehydration if IDs don't match the *primary* record for the user.
+        userData = null; // Nullify to trigger the 'no user data' path below, as the channel context is wrong.
+    }
 
     if (!userData || !userData.conversationState) {
-        console.log(`[onMessageCreate] No user data or conversation state found for ${userId} in channel ${message.channel.id}. Bot will not process this message in context of a stored conversation.`);
+        console.log(`[onMessageCreate] No user data (or matching channelId) or conversation state found for ${userId} in channel ${message.channel.id}. Bot will not process this message in context of a stored conversation.`);
         return;
     }
 
