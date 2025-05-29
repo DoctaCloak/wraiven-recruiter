@@ -1,28 +1,23 @@
 import fs from "fs";
 import path from "node:path";
 import { REST, Routes } from "discord.js";
-import dotenv from "dotenv"; // Changed from 'config' to 'dotenv' for consistency
+import { config } from "dotenv"; // Using the simpler dotenv import and call
 
-// Load environment variables from .env file at the root of the project
-const __dirname = path.dirname(new URL(import.meta.url).pathname);
-// Assuming deploy-commands.js is in the root of the 'recruiter' app, 
-// and .env is in the parent directory (workspace root)
-const envPath = path.resolve(__dirname, '../.env'); 
-dotenv.config({ path: envPath });
+config(); // Load .env from the current working directory (e.g., recruiter/.env)
 
 const { APP_ID, DISCORD_TOKEN, GUILD_ID } = process.env;
 
 // Validate essential environment variables
 if (!APP_ID || !DISCORD_TOKEN || !GUILD_ID) {
   console.error("Error: Missing essential environment variables (APP_ID, DISCORD_TOKEN, or GUILD_ID).");
-  console.error("Please ensure your .env file is correctly set up in the project root.");
+  console.error("Please ensure your .env file is correctly set up in the root of the 'recruiter' application directory.");
   process.exit(1); // Exit if essential vars are missing
 }
 
 const commands = [];
 
-const ROOT_DIR = process.cwd(); // This should be /usr/src/app in Docker
-const commandsPath = path.join(ROOT_DIR, "app/commands"); 
+// process.cwd() will be /usr/src/app in Docker, which is the root of the recruiter app
+const commandsPath = path.join(process.cwd(), "app/commands"); 
 
 console.log(`[DeployCommands] Looking for command files in: ${commandsPath}`);
 
