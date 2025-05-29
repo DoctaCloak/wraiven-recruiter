@@ -194,6 +194,7 @@ export default function onMessageCreate(client, database) {
         }
 
         // This is the history for the LLM, from combined sources, sorted.
+        let conversationHistoryForLLM;
         conversationHistoryForLLM = allMessagesTemp.map(msg => ({
             role: msg.author === "user" ? "user" : "assistant", // Map 'bot' to 'assistant' for LLM
             content: msg.content
