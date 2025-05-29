@@ -1115,13 +1115,13 @@ export default function onGuildMemberAdd(client, database) {
     }
 
     // Account Age Restriction Check
-    if (MIN_ACCOUNT_AGE_DAYS > 0) {
-        const kickedForAge = await handleAccountAgeRestriction(member);
-        if (kickedForAge) {
-            console.log(`[Event: GuildMemberAdd] User ${member.user.tag} was kicked due to account age. Processing stopped.`);
-            return;
-        }
-    }
+    // if (MIN_ACCOUNT_AGE_DAYS > 0) {
+    //     const kickedForAge = await handleAccountAgeRestriction(member);
+    //     if (kickedForAge) {
+    //         console.log(`[Event: GuildMemberAdd] User ${member.user.tag} was kicked due to account age. Processing stopped.`);
+    //         return;
+    //     }
+    // }
 
     const recruitmentCollection = database.collection("recruitment");
     let userData = await recruitmentCollection.findOne({ userId: member.id });
