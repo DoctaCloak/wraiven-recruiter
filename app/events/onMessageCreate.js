@@ -41,22 +41,31 @@ export default function onMessageCreate(client, database) {
     const messageHistoryCollection = database.collection("messageHistory");
     const userId = message.author.id;
 
+    console.log(`[onMessageCreate] Attempting to find user data for userId: ${userId}`);
     let userData = await recruitmentCollection.findOne({ userId: userId });
 
-    if (userData && userData.channelId !== message.channel.id) {
-        console.warn(`[onMessageCreate] User ${userId} found, but DB channelId (${userData.channelId}) does not match message channelId (${message.channel.id}). Attempting to update DB.`);
-        // Optionally, update the channelId in the DB if this is considered the new primary processing channel.
-        // This could happen if an old channel was deleted and a new one (somehow) created without updating the main user doc.
-        // For now, let's treat it as a mismatch and not proceed with rehydration for this specific message to be safe.
-        // Or, if confident, one could update: 
-        // await recruitmentCollection.updateOne({ userId: userId }, { $set: { channelId: message.channel.id } });
-        // userData.channelId = message.channel.id; // Reflect change locally if updated
-        // For safety, let's log and prevent rehydration if IDs don't match the *primary* record for the user.
-        userData = null; // Nullify to trigger the 'no user data' path below, as the channel context is wrong.
+    if (userData) {
+        console.log(`[onMessageCreate] User data FOUND for userId: ${userId}. Full data:`, JSON.stringify(userData, null, 2));
+        if (userData.channelId !== message.channel.id) {
+            console.warn(`[onMessageCreate] User ${userId} record has channelId '${userData.channelId}', but message is from channel '${message.channel.id}'. Mismatch.`);
+            // For safety, nullify userData to prevent rehydration with a mismatched channel context for now.
+            // Depending on desired behavior, one might update userData.channelId here if this new channel should become primary.
+            userData = null; 
+        } else {
+            console.log(`[onMessageCreate] User ${userId} record channelId '${userData.channelId}' matches message channelId '${message.channel.id}'.`);
+        }
+    } else {
+        console.log(`[onMessageCreate] User data NOT FOUND for userId: ${userId} in recruitmentCollection.`);
     }
 
-    if (!userData || !userData.conversationState) {
-        console.log(`[onMessageCreate] No user data (or matching channelId) or conversation state found for ${userId} in channel ${message.channel.id}. Bot will not process this message in context of a stored conversation.`);
+    // Proceed only if userData is still valid (exists, channel matches, and has conversationState)
+    if (!userData) {
+        console.log(`[onMessageCreate] User data invalid or channel mismatch for userId: ${userId}, channelId: ${message.channel.id}. No rehydration.`);
+        return;
+    }
+    if (!userData.conversationState) {
+        console.log(`[onMessageCreate] User data for userId: ${userId} found and channel matches, but conversationState is MISSING. No rehydration.`);
+        console.log(`[onMessageCreate] Faulty userData:`, JSON.stringify(userData, null, 2));
         return;
     }
 
