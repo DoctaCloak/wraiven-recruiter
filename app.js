@@ -56,7 +56,7 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds, // Core guild events (create, delete, update)
     GatewayIntentBits.GuildMembers, // Member add, remove, update (you have this) - Potentially privileged depending on usage
-    GatewayIntentBits.GuildBans, // Member ban, unban
+    GatewayIntentBits.GuildModeration, // Member ban, unban
     GatewayIntentBits.GuildEmojisAndStickers, // Emoji/sticker create, delete, update
     GatewayIntentBits.GuildIntegrations, // Integration updates
     GatewayIntentBits.GuildWebhooks, // Webhook updates
