@@ -15,38 +15,70 @@ export default function onGuildMemberRemove(client, database) {
     try {
       const userData = await recruitmentCollection.findOne({ userId });
 
-      if (userData && userData.channelId) {
-        const processingChannelId = userData.channelId;
-        console.log(`[Member Left] User ${member.user.tag} had a processing channel ID: ${processingChannelId}`);
-
-        const channel = member.guild.channels.cache.get(processingChannelId);
-
-        if (channel) {
-          try {
-            await channel.delete(`Processing channel for user ${member.user.tag} who left.`);
-            console.log(`[Member Left] Successfully deleted processing channel ${channel.name} (ID: ${processingChannelId}) for user ${member.user.tag}.`);
-          } catch (deleteError) {
-            console.error(`[Member Left] Failed to delete channel ${processingChannelId} for user ${member.user.tag}:`, deleteError);
-            // Optionally, still try to update the DB to prevent retries if channel is just inaccessible
-          }
+      if (userData) {
+        let channelsToDelete = [];
+        if (userData.channelId) {
+            channelsToDelete.push({ id: userData.channelId, type: "Processing Channel" });
         }
-         else {
-          console.log(`[Member Left] Processing channel ID ${processingChannelId} for user ${member.user.tag} was not found (already deleted or invalid ID).`);
+        if (userData.ticketChannelId) {
+            channelsToDelete.push({ id: userData.ticketChannelId, type: "Recruitment Ticket" });
         }
 
-        // Update the database to remove the channelId or mark as deleted, regardless of successful deletion (to prevent retries on non-existent channels)
-        try {
-          await recruitmentCollection.updateOne(
-            { userId }, 
-            { $set: { channelId: null, communityStatus: "LEFT_SERVER", applicationStatus: "LEFT_SERVER" } } // Or some other status like channelDeleted: true
-          );
-          console.log(`[Member Left] Updated database for ${member.user.tag}, removing channel ID.`);
-        } catch (dbUpdateError) {
-          console.error(`[Member Left] Failed to update database for ${member.user.tag} after channel processing:`, dbUpdateError);
-        }
+        if (channelsToDelete.length > 0) {
+            console.log(`[Member Left] User ${member.user.tag} had associated channels.`);
+            for (const chInfo of channelsToDelete) {
+                const channel = member.guild.channels.cache.get(chInfo.id);
+                if (channel) {
+                    try {
+                        await channel.delete(`${chInfo.type} for user ${member.user.tag} who left.`);
+                        console.log(`[Member Left] Successfully deleted ${chInfo.type} ${channel.name} (ID: ${chInfo.id}) for user ${member.user.tag}.`);
+                    } catch (deleteError) {
+                        console.error(`[Member Left] Failed to delete ${chInfo.type} (ID: ${chInfo.id}) for user ${member.user.tag}:`, deleteError);
+                    }
+                } else {
+                    console.log(`[Member Left] ${chInfo.type} (ID: ${chInfo.id}) for user ${member.user.tag} was not found (already deleted or invalid ID).`);
+                }
+            }
 
+            // Update the database to remove channel IDs and set status
+            try {
+              const updateQuery = {
+                $set: {
+                  communityStatus: "LEFT_SERVER",
+                  applicationStatus: "LEFT_SERVER", // Or more specific like "APPLICATION_CANCELLED_LEFT_SERVER"
+                  channelId: null, // Ensure processing channel ID is nulled
+                  ticketChannelId: null, // Ensure ticket channel ID is nulled
+                  "conversationState.currentStep": "IDLE", // Reset conversation state
+                  "conversationState.activeCollectorType": null,
+                  "conversationState.timeoutTimestamp": null
+                }
+              };
+              await recruitmentCollection.updateOne({ userId }, updateQuery);
+              console.log(`[Member Left] Updated database for ${member.user.tag}, removing channel IDs and setting status.`);
+            } catch (dbUpdateError) {
+              console.error(`[Member Left] Failed to update database for ${member.user.tag} after channel processing:`, dbUpdateError);
+            }
+        } else {
+            console.log(`[Member Left] No processing or ticket channel was associated with ${member.user.tag} in the database.`);
+             // Still update status if user record exists but no channels were linked
+            try {
+                await recruitmentCollection.updateOne(
+                    { userId }, 
+                    { $set: { 
+                        communityStatus: "LEFT_SERVER", 
+                        applicationStatus: "LEFT_SERVER",
+                        "conversationState.currentStep": "IDLE",
+                        "conversationState.activeCollectorType": null,
+                        "conversationState.timeoutTimestamp": null
+                    } }
+                );
+                console.log(`[Member Left] Updated status for ${member.user.tag} (no channels found).`);
+            } catch (dbUpdateError) {
+                console.error(`[Member Left] Failed to update status for ${member.user.tag} (no channels found):`, dbUpdateError);
+            }
+        }
       } else {
-        console.log(`[Member Left] No processing channel was associated with ${member.user.tag} in the database.`);
+        console.log(`[Member Left] No data found for ${member.user.tag} in the database.`);
       }
     } catch (error) {
       console.error(`[Member Left] Error processing guildMemberRemove event for ${member.user.tag}:`, error);
