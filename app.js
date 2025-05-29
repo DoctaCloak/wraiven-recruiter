@@ -54,12 +54,23 @@ async function connectDatabase() {
  *************************/
 const client = new Client({
   intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildPresences,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.Guilds, // Core guild events (create, delete, update)
+    GatewayIntentBits.GuildMembers, // Member add, remove, update (you have this) - Potentially privileged depending on usage
+    GatewayIntentBits.GuildBans, // Member ban, unban
+    GatewayIntentBits.GuildEmojisAndStickers, // Emoji/sticker create, delete, update
+    GatewayIntentBits.GuildIntegrations, // Integration updates
+    GatewayIntentBits.GuildWebhooks, // Webhook updates
+    GatewayIntentBits.GuildInvites, // Invite create, delete
+    GatewayIntentBits.GuildVoiceStates, // Voice state updates (e.g., user joins/leaves VC) - Less likely for recruiter
+    GatewayIntentBits.GuildPresences, // User presence updates (online, game, etc.) (you have this) - Privileged
+    GatewayIntentBits.GuildMessages, // Messages in guilds (you have this)
+    GatewayIntentBits.GuildMessageReactions, // Reactions to messages in guilds (we just added this)
+    GatewayIntentBits.GuildMessageTyping, // User starts typing in guild channel
+    GatewayIntentBits.DirectMessages, // Messages in DMs (you have this)
+    GatewayIntentBits.DirectMessageReactions, // Reactions to messages in DMs
+    GatewayIntentBits.DirectMessageTyping, // User starts typing in DM
+    GatewayIntentBits.MessageContent, // Access to message content (text, attachments, embeds) - PRIVILEGED INTENT!
+    // GatewayIntentBits.GuildScheduledEvents, // For scheduled events in guilds
   ],
 });
 
