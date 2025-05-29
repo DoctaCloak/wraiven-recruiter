@@ -371,9 +371,9 @@ async function processRejoiningUser(member, userData, recruitmentCollection) {
 
         const llmResponse = await processUserMessageWithLLM(
             validatedUserContent,
-            conversationHistoryForLLM,
             member.user.username,
-            member.id
+            member.id,
+            conversationHistoryForLLM
         );
         console.log("[RecruiterApp] LLM Response for rejoining user:", JSON.stringify(llmResponse, null, 2));
 
@@ -584,9 +584,9 @@ async function processNewUser(member, database) {
 
         const firstLlmResponse = await processUserMessageWithLLM(
           validatedUserContent,
-          conversationHistoryForLLM, 
           member.user.username,
-          member.id
+          member.id,
+          conversationHistoryForLLM 
         );
         console.log("[RecruiterApp] First LLM Response Received:", JSON.stringify(firstLlmResponse, null, 2));
 
@@ -922,7 +922,7 @@ export async function handleClarificationLoop(
           await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channelId, validatedClarificationContent, m.id); // Log user message
           conversationHistoryForLLM.push({ role: "user", content: validatedClarificationContent });
 
-          const followUpLlmResponse = await processUserMessageWithLLM(validatedClarificationContent, conversationHistoryForLLM, member.user.username, userId);
+          const followUpLlmResponse = await processUserMessageWithLLM(validatedClarificationContent, member.user.username, userId, conversationHistoryForLLM);
           await handleClarificationLoop(member, channel, followUpLlmResponse, conversationHistoryForLLM, recruitmentCollection, messageHistoryCollection, guild, attemptCount + 1, m.id);
         });
 
@@ -959,7 +959,7 @@ export async function handleClarificationLoop(
           await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channelId, validatedGeneralContent, m.id);
           conversationHistoryForLLM.push({ role: "user", content: validatedGeneralContent });
 
-          const followUpLlmResponse = await processUserMessageWithLLM(validatedGeneralContent, conversationHistoryForLLM, member.user.username, userId);
+          const followUpLlmResponse = await processUserMessageWithLLM(validatedGeneralContent, member.user.username, userId, conversationHistoryForLLM);
           await handleClarificationLoop(member, channel, followUpLlmResponse, conversationHistoryForLLM, recruitmentCollection, messageHistoryCollection, guild, 0, m.id); // Reset attemptCount for new general interaction
         });
 
@@ -1041,7 +1041,7 @@ export async function handleClarificationLoop(
           conversationHistoryForLLM.push({ role: "user", content: validatedVouchContent });
 
           // Reprocess with LLM to extract mention or confirm intent with new info.
-          const vouchLlmResponse = await processUserMessageWithLLM(validatedVouchContent, conversationHistoryForLLM, member.user.username, userId);
+          const vouchLlmResponse = await processUserMessageWithLLM(validatedVouchContent, member.user.username, userId, conversationHistoryForLLM);
           await handleClarificationLoop(member, channel, vouchLlmResponse, conversationHistoryForLLM, recruitmentCollection, messageHistoryCollection, guild, attemptCount + 1, m.id);
         });
 
@@ -1106,7 +1106,7 @@ export async function handleClarificationLoop(
             const validatedDefaultGeneralContent = (m.content && m.content.trim() !== "") ? m.content : PLACEHOLDER_EMPTY_CONTENT;
             await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channelId, validatedDefaultGeneralContent, m.id);
             conversationHistoryForLLM.push({ role: "user", content: validatedDefaultGeneralContent });
-            const followUpLlmResponse = await processUserMessageWithLLM(validatedDefaultGeneralContent, conversationHistoryForLLM, member.user.username, userId);
+            const followUpLlmResponse = await processUserMessageWithLLM(validatedDefaultGeneralContent, member.user.username, userId, conversationHistoryForLLM);
             await handleClarificationLoop(member, channel, followUpLlmResponse, conversationHistoryForLLM, recruitmentCollection, messageHistoryCollection, guild, 0, m.id);
           });
     
