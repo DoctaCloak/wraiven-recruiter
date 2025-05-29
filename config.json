@@ -1,0 +1,31 @@
+{
+  "GUILD_NAME": "Wraiven",
+  "ROLES": {
+    "MEMBER": "Wraiven",
+    "FRIEND": "Friend",
+    "RECRUITER": "Recruiter",
+    "BOT": "Wraiven Bot",
+    "OUTSIDER": "Outsider"
+  },
+  "CATEGORIES": {
+    "RECRUITMENT_PROCESSING": "Recruitment Processing",
+    "STAFF_NOTIFICATIONS": "COUNCIL",
+    "CITY_GATES": "City Gates" 
+  },
+  "CHANNELS": {
+    "STAFF_NOTIFICATIONS": "🤖┃recruiter-bot-questions",
+    "BOT_COMMANDS": "bot-commands"
+  },
+  "LLM": {
+    "PROMPT_GUILD_NAME": "Wraiven" 
+  },
+  "ACCOUNT_RESTRICTIONS": {
+    "MIN_ACCOUNT_AGE_DAYS": 14
+  },
+  "TIMERS": {
+    "VOUCH_REACTION_TIME_LIMIT_HOURS": 24,
+    "INITIAL_USER_RESPONSE_MINUTES": 5,
+    "VOUCH_MENTION_CLARIFICATION_MINUTES": 2,
+    "GENERAL_CLARIFICATION_MINUTES": 3
+  }
+} 

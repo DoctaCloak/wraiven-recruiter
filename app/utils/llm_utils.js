@@ -6,13 +6,21 @@
  */
 
 import OpenAI from 'openai';
-import { config } from 'dotenv';
+import dotenv from 'dotenv';
+import path from 'path';
+import fs from 'fs';
 
-config();
-const { OPENAI_API_KEY } = process.env;
+// Load configuration for Guild Name
+const configPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../config.json');
+const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+const GUILD_NAME = config.LLM.PROMPT_GUILD_NAME || "Wraiven"; // Fallback just in case
+
+// Load environment variables from .env file at the root of the 'recruiter' app parent directory
+const envPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../.env');
+dotenv.config({ path: envPath });
 
 const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
 // Define the structure we expect the LLM to return
@@ -36,11 +44,11 @@ const expectedJsonResponseFormat = {
  * Builds the prompt for the LLM, including system message, conversation history, and current user message.
  */
 function buildFullPrompt(userMessage, userId, guildInfo, conversationHistory = []) {
-  const systemPrompt = `You are an advanced AI assistant for "Wraiven", a Discord recruitment bot for the MMORPG Albion Online Guild "Wraiven".
+  const systemPrompt = `You are an advanced AI assistant for "${GUILD_NAME}", a Discord recruitment bot for the MMORPG Albion Online Guild "${GUILD_NAME}".
 Your primary goal is to understand new user intentions when they first join the server and send a message in their private processing channel.
 You must classify their intent and extract relevant information according to the rules below.
 
-Guild Name: Wraiven
+Guild Name: ${GUILD_NAME}
 Recruitment Focus: Raiding, M+, Social. We are looking for dedicated players for endgame content and active community members.
 Current User ID: ${userId}
 
@@ -91,116 +99,109 @@ Do NOT add any text before or after the JSON object.`;
 export async function processUserMessageWithLLM(
   userMessage,
   userId,
-  conversationHistory = []
+  conversationHistory = [],
+  channelId = null
 ) {
   if (!process.env.OPENAI_API_KEY) {
-    console.error("[LLM ERROR] OpenAI API key is not configured.");
-    return { // Return a fallback error structure
-        intent: "LLM_ERROR",
-        entities: {},
-        suggested_bot_response: "I'm currently unable to process requests with my advanced AI. Please contact a staff member directly.",
-        confidence_score: 0,
-        requires_clarification: true,
-        next_action_suggestion: "ALERT_STAFF_LLM_DOWN"
+    console.error("[LLM] OpenAI API key is not set. Skipping LLM call.");
+    // Return a default mock response or error structure
+    return {
+      intent: "ERROR_NO_API_KEY",
+      entities: {},
+      suggested_bot_response: "I am currently unable to process requests with AI. Please contact a staff member.",
+      requires_clarification: false,
+      error: "OpenAI API key missing",
     };
   }
 
   const guildInfo = { /* You can expand this with dynamic guild info if needed */ };
-  const fullPrompt = buildFullPrompt(userMessage, userId, guildInfo, conversationHistory);
+  const systemPrompt = await buildFullPrompt(userMessage, userId, guildInfo, conversationHistory);
 
-  console.log(`[LLM Request] Processing message for user ${userId}: "${userMessage}"`);
-  // console.log("[LLM Request] Full prompt being sent (first 200 chars):", fullPrompt.substring(0,200)); // For debugging, be careful with logging full prompts
+  const messagesForApi = [
+    { role: "system", content: systemPrompt },
+    // Add existing conversation history, ensuring correct roles (user/assistant)
+    ...conversationHistory.map(msg => ({
+        // Adjust if your history object has a different structure for role, e.g., msg.author === 'bot' ? 'assistant' : 'user'
+        role: msg.role || (msg.author === 'bot' ? 'assistant' : 'user'), 
+        content: msg.content
+    })),
+    { role: "user", content: userMessage },
+  ];
+
+  console.log("[LLM] Sending request to OpenAI with messages:", JSON.stringify(messagesForApi, null, 2));
 
   try {
     const completion = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo-0125", // Or "gpt-4o" or other suitable model
-      messages: [
-        { role: "system", content: "You are a helpful assistant that only responds in JSON." }, // Basic system message for chat model
-        { role: "user", content: fullPrompt } // Our detailed prompt instructing JSON output and task
-      ],
-      temperature: 0.5, // Lower for more deterministic, higher for more creative
-      max_tokens: 500,  // Adjust as needed for expected JSON size
-      // response_format: { type: "json_object" }, // Uncomment if using a model/API version that explicitly supports JSON mode
+      model: "gpt-3.5-turbo-0125", // Or your preferred model like gpt-4o
+      messages: messagesForApi,
+      response_format: { type: "json_object" }, // Enforce JSON output if using a compatible model
+      temperature: 0.5, // Lower temperature for more deterministic, less creative responses for classification/extraction
     });
 
-    const llmOutputText = completion.choices[0]?.message?.content;
+    const llmResponseContent = completion.choices[0]?.message?.content;
+    console.log("[LLM] Raw response from OpenAI:", llmResponseContent);
 
-    if (!llmOutputText) {
-      console.error("[LLM ERROR] No content in LLM response.");
-      return { // Return a fallback error structure
-        intent: "LLM_NO_RESPONSE_CONTENT",
+    if (!llmResponseContent) {
+      console.error("[LLM] Received empty content from OpenAI.");
+      return {
+        intent: "ERROR_OPENAI_EMPTY_RESPONSE",
         entities: {},
-        suggested_bot_response: "My AI core provided an empty response. A guild officer will be with you shortly.",
-        confidence_score: 0,
-        requires_clarification: true,
-        next_action_suggestion: "ALERT_STAFF_LLM_EMPTY_RESPONSE"
+        suggested_bot_response: "I received an unusual response from the AI. Please try rephrasing, or a staff member can assist.",
+        requires_clarification: false,
+        error: "OpenAI returned empty content",
       };
     }
 
-    console.log("[LLM Raw Response]:", llmOutputText);
-
-    // Attempt to parse the LLM output as JSON
-    let parsedResponse;
     try {
-      parsedResponse = JSON.parse(llmOutputText);
-    } catch (jsonError) {
-      console.error("[LLM ERROR] Failed to parse LLM response as JSON:", jsonError);
-      console.error("[LLM ERROR] Non-JSON response received:", llmOutputText);
-      // Fallback: Try to extract JSON from a string that might have markdown backticks
-      const jsonMatch = llmOutputText.match(/```json\n([\s\S]*?)\n```/);
-      if (jsonMatch && jsonMatch[1]) {
-        try {
-          parsedResponse = JSON.parse(jsonMatch[1]);
-          console.log("[LLM Info] Successfully extracted JSON from markdown.");
-        } catch (e) {
-            console.error("[LLM ERROR] Still failed to parse extracted JSON:", e);
-            return { // Return a fallback error structure
-                intent: "LLM_RESPONSE_FORMAT_ERROR",
-                entities: {},
-                suggested_bot_response: "I received a response, but it wasn't in the format I expected after an initial parsing attempt. A guild officer will assist you shortly.",
-                confidence_score: 0,
-                requires_clarification: true,
-                next_action_suggestion: "ALERT_STAFF_LLM_FORMAT_ISSUE_POST_EXTRACTION"
-            };
-        }
-      } else {
-        return { // Return a fallback error structure if no JSON is found
-            intent: "LLM_RESPONSE_FORMAT_ERROR",
-            entities: {},
-            suggested_bot_response: "I'm having trouble understanding the response from my AI core. Please wait for a guild officer.",
-            confidence_score: 0,
-            requires_clarification: true,
-            next_action_suggestion: "ALERT_STAFF_LLM_FORMAT_ISSUE_NO_JSON"
-        };
+      const parsedResponse = JSON.parse(llmResponseContent);
+      console.log("[LLM] Parsed LLM JSON response:", JSON.stringify(parsedResponse, null, 2));
+      // Basic validation for expected fields (can be expanded)
+      if (typeof parsedResponse.intent !== 'string' || typeof parsedResponse.suggested_bot_response !== 'string') {
+          console.error("[LLM] Parsed JSON is missing required fields (intent, suggested_bot_response).");
+          throw new Error("LLM response missing required fields."); // Caught by outer catch
       }
-    }
+      return parsedResponse;
+    } catch (jsonParseError) {
+      console.error("[LLM] Failed to parse JSON response from OpenAI:", jsonParseError);
+      console.error("[LLM] Non-JSON content was: ", llmResponseContent); // Log the problematic content
+      // Attempt to extract intent if it looks like a simple string response (fallback)
+      let fallbackIntent = "UNCLEAR_INTENT";
+      if (llmResponseContent.toLowerCase().includes("apply") || llmResponseContent.toLowerCase().includes("join guild")) {
+          fallbackIntent = "GUILD_APPLICATION_INTEREST";
+      }
+      // Add more fallback intent checks if needed
 
-    // TODO: Validate parsedResponse against the expectedJsonResponseFormat structure
-    // For now, we assume it's correct if parsing succeeded.
-
-    console.log("[LLM Parsed Response]:", JSON.stringify(parsedResponse, null, 2));
-    return parsedResponse;
-
-  } catch (error) {
-    console.error("[LLM ERROR] Error calling OpenAI API:", error);
-    let errorIntent = "LLM_API_ERROR_UNKNOWN";
-    let errorMessage = "There was an unknown issue communicating with my advanced AI services. A staff member will be with you soon.";
-
-    if (error instanceof OpenAI.APIError) {
-        errorIntent = `LLM_API_ERROR_\${error.status || 'GENERIC'}`;
-        errorMessage = `AI Service Error (Status: ${error.status || 'N/A'}): ${error.name} - ${error.message}. A staff member will assist.`;
-        if (error.status === 401) errorMessage = "AI Service Error: Authentication failed. Please check API key. Staff notified.";
-        if (error.status === 429) errorMessage = "AI Service Error: Rate limit exceeded. Please try again later. Staff notified.";
-        if (error.status === 500) errorMessage = "AI Service Error: Internal server error on AI provider side. Please try again later. Staff notified.";
-    }
-    
-    return { // Return a fallback error structure
-        intent: errorIntent,
-        entities: {},
-        suggested_bot_response: errorMessage,
-        confidence_score: 0,
+      return {
+        intent: fallbackIntent,
+        entities: { original_response_if_not_json: llmResponseContent },
+        suggested_bot_response: `I had a little trouble understanding the AI's last message. It said: "${llmResponseContent.substring(0,1000)}". Could you try rephrasing your request? Or a staff member can help.`,
         requires_clarification: true,
-        next_action_suggestion: "ALERT_STAFF_LLM_API_DOWN"
+        error: "Failed to parse LLM JSON response",
+      };
+    }
+  } catch (error) {
+    console.error("[LLM] Error calling OpenAI API:", error);
+    let errorMessage = "An unexpected error occurred while contacting the AI.";
+    if (error.response) { // Axios-style error checking, or check specific OpenAI error properties
+        console.error("[LLM] OpenAI API Error Status:", error.response.status);
+        console.error("[LLM] OpenAI API Error Data:", error.response.data);
+        errorMessage = `AI Service Error: ${error.response.data?.error?.message || error.message}`;
+    } else if (error.message) {
+        errorMessage = `AI Service Error: ${error.message}`;
+    }
+
+    // Check for specific error types, like authentication
+    if (error.message && error.message.includes("authentication")) {
+        errorMessage = "AI authentication failed. Please check the API key configuration.";
+        // Consider more drastic action like disabling LLM features temporarily
+    }
+
+    return {
+      intent: "ERROR_OPENAI_API_CALL",
+      entities: {},
+      suggested_bot_response: errorMessage,
+      requires_clarification: false,
+      error: error.message || "OpenAI API call failed",
     };
   }
 }

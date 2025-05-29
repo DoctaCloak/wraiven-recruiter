@@ -1,13 +1,34 @@
-import { Events, PermissionsBitField } from "discord.js";
-import { getAccountRestrictionEmbed } from "./utils/onGuildMemberAdd.js";
+import { Events, PermissionsBitField, ChannelType } from "discord.js";
+import fs from 'fs';
+import path from 'path';
+// import { getAccountRestrictionEmbed } from "./utils/onGuildMemberAdd.js"; // This utility was self-contained or needs to be re-evaluated
 import { processUserMessageWithLLM } from "../utils/llm_utils.js";
-import { initiateVouchProcess } from "../utils/discord_actions.js";
+import { initiateVouchProcess, notifyStaff } from "../utils/discord_actions.js";
+
+// Load configuration
+const configPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../config.json');
+const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
 
 /********************************************
- * CONSTANTS & CONFIG
+ * CONSTANTS & CONFIG (from config.json)
  ********************************************/
-const MIN_ACCOUNT_AGE_DAYS = 14;
+const MIN_ACCOUNT_AGE_DAYS = config.ACCOUNT_RESTRICTIONS.MIN_ACCOUNT_AGE_DAYS;
 const MIN_ACCOUNT_AGE_MS = MIN_ACCOUNT_AGE_DAYS * 24 * 60 * 60 * 1000;
+
+const GUILD_NAME = config.GUILD_NAME;
+const PROCESSING_CATEGORY_NAME = config.CATEGORIES.RECRUITMENT_PROCESSING; // Assuming this is what "City Gates" was for, or add a new specific config
+const CITY_GATES_CATEGORY_NAME = config.CATEGORIES.CITY_GATES;
+const MEMBER_ROLE_NAME = config.ROLES.MEMBER;
+const BOT_COMMAND_CHANNEL_NAME = config.CHANNELS.BOT_COMMANDS;
+const FRIEND_ROLE_NAME = config.ROLES.FRIEND;
+const RECRUITER_ROLE_NAME = config.ROLES.RECRUITER;
+const BOT_ROLE_NAME = config.ROLES.BOT;
+const OUTSIDER_ROLE_NAME = config.ROLES.OUTSIDER;
+
+const INITIAL_USER_RESPONSE_TIMEOUT_MS = config.TIMERS.INITIAL_USER_RESPONSE_MINUTES * 60 * 1000;
+const VOUCH_MENTION_CLARIFICATION_TIMEOUT_MS = config.TIMERS.VOUCH_MENTION_CLARIFICATION_MINUTES * 60 * 1000;
+const GENERAL_CLARIFICATION_TIMEOUT_MS = config.TIMERS.GENERAL_CLARIFICATION_MINUTES * 60 * 1000;
+
 
 const ACCESS_STATUS = {
   PENDING: "PENDING",
@@ -21,17 +42,18 @@ const COMMUNITY_STATUS = {
   ACCEPTED: "ACCEPTED",
 };
 
-/**
- * Example role map.
- */
+// Roles Map - uses names from config now
 const rolesMap = new Map();
-rolesMap.set("RECRUITER", "Recruiter");
-rolesMap.set("BOT", "Wraiven Bot");
+rolesMap.set("RECRUITER", RECRUITER_ROLE_NAME);
+rolesMap.set("BOT", BOT_ROLE_NAME);
 
 
 /********************************************
  * HELPER FUNCTIONS
  ********************************************/
+
+// Function getAccountRestrictionEmbed would need to be defined here or imported if used.
+// For now, assuming it's either not critical or defined elsewhere if handleAccountAgeRestriction is uncommented.
 
 /**
  * Kicks the user if their account is younger than MIN_ACCOUNT_AGE_DAYS.
@@ -43,9 +65,9 @@ async function handleAccountAgeRestriction(member) {
 
   if (accountAge < MIN_ACCOUNT_AGE_MS) {
     try {
-      await member.send({
-        embeds: [getAccountRestrictionEmbed(member.user)],
-      });
+      // Placeholder for embed logic if getAccountRestrictionEmbed is not available
+      await member.send(`Your account is too new to join. Accounts must be at least ${MIN_ACCOUNT_AGE_DAYS} days old.`);
+      console.log(`Sent account age restriction DM to ${member.user.tag}`);
     } catch (dmError) {
       console.error(`Failed to DM ${member.user.tag}:`, dmError);
     }
@@ -64,29 +86,92 @@ async function handleAccountAgeRestriction(member) {
 }
 
 /**
- * Ensures we have (or create) a "City Gates" category.
+ * Ensures we have (or create) a category (e.g. "City Gates").
  * Returns the category channel, or null if creation fails.
  */
-async function ensureCityGatesCategory(guild) {
-  // channel.type === 4 -> Category in Discord.js v14
+async function ensureCategory(guild, categoryName) {
   let category = guild.channels.cache.find(
-    (ch) => ch.type === 4 && ch.name === "City Gates"
+    (ch) => ch.type === ChannelType.GuildCategory && ch.name === categoryName
   );
 
   if (!category) {
     try {
       category = await guild.channels.create({
-        name: "City Gates",
-        type: 4,
+        name: categoryName,
+        type: ChannelType.GuildCategory,
       });
-      console.log(`Created "City Gates" category successfully.`);
+      console.log(`Created "${categoryName}" category successfully.`);
     } catch (error) {
-      console.error(`Unable to create "City Gates" category: `, error);
+      console.error(`Unable to create "${categoryName}" category: `, error);
       return null;
     }
   }
-
   return category;
+}
+
+
+/**
+ * Ensures the user's "processing" channel exists and permissions are correct.
+ * Returns the channel. Creates it if needed; updates perms if it exists.
+ */
+async function ensureUserProcessingChannel(
+  member,
+  channelId,
+  recruitmentCollection
+) {
+  const guild = member.guild;
+
+  // 1) Find or create the processing category
+  const processingCategory = await ensureCategory(guild, PROCESSING_CATEGORY_NAME);
+  if (!processingCategory) {
+      console.error(`Failed to find or create the category: ${PROCESSING_CATEGORY_NAME}. Processing channel cannot be created.`);
+      // Notify staff about this critical issue
+      await notifyStaff(guild, `CRITICAL: Could not find or create the category named \"${PROCESSING_CATEGORY_NAME}\". New user processing channels cannot be created. Please check bot permissions and category configuration.`, "CONFIG_ERROR_PROCESSING_CATEGORY");
+      return null;
+  }
+
+  // 2) See if we already have a channel ID in DB
+  let channel = channelId ? guild.channels.cache.get(channelId) : null;
+
+  if (!channel) {
+    const channelName = `processing-${member.user.username}`;
+    try {
+        channel = await guild.channels.create({
+            name: channelName,
+            type: ChannelType.GuildText,
+            parent: processingCategory.id, // Use the fetched/created category ID
+        });
+
+        await recruitmentCollection.updateOne(
+            { userId: member.user.id },
+            { $set: { channelId: channel.id } }
+        );
+        console.log(`Created channel "${channelName}" for ${member.user.tag} in category "${processingCategory.name}"`);
+    } catch (error) {
+        console.error(`Failed to create processing channel for ${member.user.tag}:`, error);
+        const botCommandsChannel = guild.channels.cache.find(ch => ch.name === BOT_COMMAND_CHANNEL_NAME && ch.type === ChannelType.GuildText);
+        if (botCommandsChannel) {
+            await botCommandsChannel.send(`Critical error: Could not create processing channel for ${member.user.tag} in category ${PROCESSING_CATEGORY_NAME}. Please check permissions. User has been informed.`);
+        }
+        try {
+            await member.send("I was unable to create a private channel for you due to a server configuration issue. Please contact a staff member.");
+        } catch (dmErr) { console.error("Failed to DM user about channel creation failure", dmErr);}
+        return null; 
+    }
+  } else {
+    console.log(
+      `Using existing channel (#${channel.name}) for ${member.user.tag}`
+    );
+  }
+
+  try {
+    const permissionOverwrites = buildProcessingChannelPermissions(member, guild); // buildProcessingChannelPermissions uses rolesMap which now uses config
+    await channel.permissionOverwrites.set(permissionOverwrites);
+  } catch (error) {
+      console.error(`Failed to set permissions for channel ${channel.name} for ${member.user.tag}:`, error);
+  }
+
+  return channel;
 }
 
 /**
@@ -145,53 +230,6 @@ function buildProcessingChannelPermissions(member, guild) {
 }
 
 /**
- * Ensures the user's "processing" channel exists and permissions are correct.
- * Returns the channel. Creates it if needed; updates perms if it exists.
- */
-async function ensureUserProcessingChannel(
-  member,
-  channelId,
-  recruitmentCollection
-) {
-  const guild = member.guild;
-
-  // 1) Find or create the "City Gates" category
-  const cityGatesCategory = await ensureCityGatesCategory(guild);
-
-  // 2) See if we already have a channel ID in DB
-  let channel = channelId ? guild.channels.cache.get(channelId) : null;
-
-  if (!channel) {
-    // Channel doesn't exist—create a new one
-    const channelName = `processing-${member.user.username}`;
-    channel = await guild.channels.create({
-      name: channelName,
-      type: 0, // text channel
-      parent: cityGatesCategory ? cityGatesCategory.id : null,
-    });
-
-    // Save the new channel ID in DB
-    await recruitmentCollection.updateOne(
-      { userId: member.user.id },
-      { $set: { channelId: channel.id } }
-    );
-
-    console.log(`Created channel "${channelName}" for ${member.user.tag}`);
-  } else {
-    console.log(
-      `Using existing channel (#${channel.name}) for ${member.user.tag}`
-    );
-  }
-
-  // 3) Set or update permission overwrites (always ensure the correct perms)
-  const permissionOverwrites = buildProcessingChannelPermissions(member, guild);
-  await channel.permissionOverwrites.set(permissionOverwrites);
-
-  // 4) Return the channel reference
-  return channel;
-}
-
-/**
  * Processes a rejoining user:
  *  - Reassign their old role, if it still exists.
  *  - Ensure or re-create their processing channel (and set perms).
@@ -201,7 +239,8 @@ async function processRejoiningUser(member, userData, recruitmentCollection) {
   console.log(`User ${member.user.tag} rejoined the server.`);
 
   const guild = member.guild;
-  const { role, channelId, messageHistory } = userData;
+  const { role, channelId } = userData;
+  let messageHistory = userData.messageHistory || []; // Ensure messageHistory is an array
 
   // Re-assign stored role by name (if it exists)
   const storedRole = guild.roles.cache.find((r) => r.name === role);
@@ -223,6 +262,10 @@ async function processRejoiningUser(member, userData, recruitmentCollection) {
     channelId,
     recruitmentCollection
   );
+  if (!channel) {
+    console.error(`[ProcessRejoin] Could not ensure processing channel for ${member.user.tag}. Aborting.`);
+    return; // Critical failure, cannot proceed
+  }
 
   // DM the user with their channel link (optional; only if newly created?)
   const channelLink = `https://discord.com/channels/${guild.id}/${channel.id}`;
@@ -238,7 +281,7 @@ async function processRejoiningUser(member, userData, recruitmentCollection) {
   // Send a welcome-back message
   await channel.send(
     `Hey, welcome back **${member.user.username}**!\n${
-      messageHistory?.length
+      messageHistory.length
         ? "Are you here to continue where you left off?"
         : "Let us know how we can help you this time!"
     }`
@@ -257,22 +300,32 @@ async function processNewUser(member, database) {
   const guild = member.guild;
   const userId = member.user.id;
   const recruitmentCollection = database.collection("recruitment");
+  const messageHistoryCollection = database.collection("messageHistory");
 
-  // Attempt to assign "Outsider" role
-  const outsiderRole = guild.roles.cache.find((r) => r.name === "Outsider");
+  const outsiderRole = guild.roles.cache.find((r) => r.name === OUTSIDER_ROLE_NAME);
   if (outsiderRole && !member.roles.cache.has(outsiderRole.id)) {
     try {
       await member.roles.add(outsiderRole);
-      console.log(`Assigned "Outsider" role to ${member.user.tag}`);
+      console.log(`Assigned "${OUTSIDER_ROLE_NAME}" role to ${member.user.tag}`);
     } catch (error) {
       console.error(
-        `Error assigning "Outsider" role to ${member.user.tag}:`,
+        `Error assigning "${OUTSIDER_ROLE_NAME}" role to ${member.user.tag}:`,
         error
       );
     }
   }
 
-  // Initialize user in DB
+  const channel = await ensureUserProcessingChannel(
+    member,
+    null, 
+    recruitmentCollection
+  );
+
+  if (!channel) {
+    console.error(`[ProcessNewUser] Could not ensure processing channel for ${member.user.tag}. Aborting new user setup.`);
+    return; 
+  }
+
   try {
     await recruitmentCollection.updateOne(
       { userId },
@@ -280,12 +333,14 @@ async function processNewUser(member, database) {
         $set: {
           userId,
           username: member.user.username,
-          channelId: null,
-          messageHistory: [],
+          channelId: channel.id, 
           applicationStatus: ACCESS_STATUS.PENDING,
           communityStatus: COMMUNITY_STATUS.PENDING,
-          role: outsiderRole ? outsiderRole.name : null,
-          joinedAt: Date.now(),
+          role: outsiderRole ? outsiderRole.name : null, // Uses OUTSIDER_ROLE_NAME
+          joinedAt: new Date(), 
+          lastActivityAt: new Date(),
+          messageHistory: [], 
+          logs: [{timestamp: new Date(), event: "New user processed"}]
         },
       },
       { upsert: true }
@@ -295,39 +350,34 @@ async function processNewUser(member, database) {
     console.error(`Error initializing DB entry for ${member.user.tag}:`, error);
   }
 
-  // Ensure (create) the user's processing channel
-  const channel = await ensureUserProcessingChannel(
-    member,
-    null, // no channelId since brand-new
-    recruitmentCollection
-  );
-
-  // DM them the link
   const channelLink = `https://discord.com/channels/${guild.id}/${channel.id}`;
   try {
     await member.send(
-      `Hello **${member.user.username}**, welcome to Wraiven!
-` +
+      `Hello **${member.user.username}**, welcome to ${GUILD_NAME}!\n` +
         `Your private channel is ready: ${channelLink}`
     );
   } catch (dmError) {
     console.error(`Failed to DM ${member.user.tag}:`, dmError);
   }
 
-  // Post a welcome message in their channel
-  await channel.send(
-    `Hello, **${member.user.username}**, welcome to Wraiven!`
-  );
-  await channel.send(
-    "What is your purpose for joining the Wraiven Discord channel?"
-  );
+  const welcomeMsg1 = `Hello, **${member.user.username}**, welcome to ${GUILD_NAME}!`;
+  const welcomeMsg2 = `What is your purpose for joining the ${GUILD_NAME} Discord channel?`; // Used GUILD_NAME
+  await channel.send(welcomeMsg1);
+  await channel.send(welcomeMsg2);
 
-  // Collect the user's first message in response
-  const filter = (m) => m.author.id === member.id;
+  try {
+    await messageHistoryCollection.insertMany([
+        { userId, channelId: channel.id, author: "bot", content: welcomeMsg1, timestamp: new Date() },
+        { userId, channelId: channel.id, author: "bot", content: welcomeMsg2, timestamp: new Date() }
+    ]);
+  } catch(e){ console.error("DB Error logging welcome messages:", e); }
+
+
+  const filter = (m) => m.author.id === member.id && m.channel.id === channel.id;
   const collector = channel.createMessageCollector({
     filter,
-    max: 1, // Collect only one message for this initial interaction
-    time: 5 * 60 * 1000, // 5 minutes
+    max: 1, 
+    time: INITIAL_USER_RESPONSE_TIMEOUT_MS, // Used config timer
   });
 
   collector.on("collect", async (message) => {
@@ -335,58 +385,70 @@ async function processNewUser(member, database) {
       `Collected response from ${member.user.tag}: "${message.content}"`
     );
 
-    // 1. Store the user's message in messageHistory
     try {
+      await messageHistoryCollection.insertOne({
+        userId: member.user.id,
+        channelId: channel.id,
+        author: "user",
+        content: message.content,
+        timestamp: new Date(message.createdTimestamp),
+      });
       await recruitmentCollection.updateOne(
-        { userId: member.user.id },
-        {
-          $push: {
-            messageHistory: {
-              author: "user",
-              content: message.content,
-              timestamp: message.createdTimestamp,
-            },
-          },
-          $set: { lastActivityAt: Date.now() } // Update last activity timestamp
-        }
+        { userId: member.user.id }, 
+        { $set: { lastActivityAt: new Date() } }
       );
     } catch (dbError) {
       console.error(
-        `Error updating message history with user message for ${member.user.tag}:`,
+        `Error saving user message to messageHistoryCollection for ${member.user.tag}:`,
         dbError
       );
-      // Potentially send an error message or alert, but continue for now
     }
 
-    // 2. Fetch updated conversation history for the LLM
-    let conversationHistory = [];
+    let conversationHistoryForLLM = [];
     try {
-      const userData = await recruitmentCollection.findOne({ userId: member.user.id });
-      if (userData && userData.messageHistory) {
-        conversationHistory = userData.messageHistory.map((histMessage) => ({
-          author: histMessage.author, // Assumes DB stores 'user' or 'bot'
-          content: histMessage.content,
-        }));
-      }
+      const userHistory = await messageHistoryCollection.find(
+          { userId: member.user.id, channelId: channel.id }
+        ).sort({ timestamp: 1 }).toArray(); 
+      
+      conversationHistoryForLLM = userHistory.map((histMessage) => ({
+        role: histMessage.author === "user" ? "user" : "assistant", 
+        content: histMessage.content,
+      }));
     } catch (dbError) {
       console.error(
-        `Error fetching conversation history for ${member.user.tag}:`,
+        `Error fetching conversation history for LLM for ${member.user.tag}:`,
         dbError
       );
-      // LLM will proceed without history if this fails
     }
 
-    // 3. Call the LLM (mock for now)
     const llmResponse = await processUserMessageWithLLM(
-      message.content,
+      message.content, 
       member.user.id,
-      conversationHistory
+      conversationHistoryForLLM, 
+      channel.id
     );
     console.log("[RecruiterApp] LLM Response Received:", JSON.stringify(llmResponse, null, 2));
 
-    // 4. Bot acts based on LLM output
-    let botResponseMessageContent;
-    let performedComplexAction = false; // Flag to see if a specific intent handler took over
+    async function logBotMsgToHistory(msgContent, llmRespObj = null) {
+        if (!msgContent) return;
+        try {
+            const logEntry = {
+                userId: member.user.id,
+                channelId: channel.id,
+                author: "bot",
+                content: msgContent,
+                timestamp: new Date()
+            };
+            if (llmRespObj) logEntry.llm_response_object = llmRespObj;
+            await messageHistoryCollection.insertOne(logEntry);
+            await recruitmentCollection.updateOne(
+              { userId: member.user.id }, 
+              { $set: { lastActivityAt: new Date() } }
+            );
+        } catch (e) { console.error("[RecruiterApp] DB Error logging bot message:", e); }
+    }
+    
+    let botResponseMessageContent; 
 
     if (llmResponse && llmResponse.intent) {
       switch (llmResponse.intent) {
@@ -397,7 +459,6 @@ async function processNewUser(member, database) {
           let voucherMember; 
 
           if (vouchPersonName) {
-            const guild = member.guild;
             voucherMember = guild.members.cache.find(m => 
               m.user.username.toLowerCase() === vouchPersonName.toLowerCase() || 
               m.displayName.toLowerCase() === vouchPersonName.toLowerCase() ||
@@ -406,76 +467,53 @@ async function processNewUser(member, database) {
           }
 
           if (voucherMember) {
-            // Found voucher on first try
             console.log(`[RecruiterApp] VOUCH: Found potential voucher on first attempt: ${voucherMember.user.tag}`);
-            // Send the LLM's response now that we know we have a valid voucher to reference
-            let initialVouchResponse = llmResponse.suggested_bot_response || `Thanks for letting me know you know ${voucherMember.user.tag}! I'll start the vouch process.`;
-            await channel.send(initialVouchResponse);
-            // Log this specific message to history, then nullify botResponseMessageContent before calling initiateVouchProcess
-            // as initiateVouchProcess will handle further distinct messages.
-            try {
-                await recruitmentCollection.updateOne(
-                  { userId: member.user.id },
-                  {
-                    $push: { messageHistory: { author: "bot", content: initialVouchResponse, timestamp: Date.now() } },
-                    $set: { lastActivityAt: Date.now() }
-                  }
-                );
-            } catch (dbError) { console.error("[RecruiterApp] VOUCH: DB error logging initial vouch ack:", dbError); }
+            botResponseMessageContent = llmResponse.suggested_bot_response || `Thanks for letting me know you know ${voucherMember.user.tag}! I'll start the vouch process.`;
+            await channel.send(botResponseMessageContent);
+            await logBotMsgToHistory(botResponseMessageContent, llmResponse); 
             
-            await initiateVouchProcess(member, voucherMember, channel, llmResponse, recruitmentCollection);
-            botResponseMessageContent = null; // Vouch process handles its own messages from here
+            await initiateVouchProcess(member, voucherMember, channel, llmResponse, recruitmentCollection, messageHistoryCollection);
+            botResponseMessageContent = null; 
           } else {
-            // Voucher not found or not specified clearly by LLM, ask for @mention
             let clarificationMessageText = "";
-            if (vouchPersonName) { // LLM provided a name, but we couldn't find them
+            if (vouchPersonName) {
                 console.log(`[RecruiterApp] VOUCH: Could not find voucher member by name/ID: ${vouchPersonName} from initial LLM response.`);
                 clarificationMessageText = `I see you mentioned ${vouchPersonName}, but I couldn't find them in the server. Could you please @mention them directly in your next message?`;
-            } else { // LLM likely set vouch_person_name to null (e.g., for "friends")
+            } else { 
                 console.log("[RecruiterApp] VOUCH: vouch_person_name was null or unclear from LLM. Asking for @mention.");
-                // Use suggested_bot_response if it already asks for clarification, or a default.
                 if (llmResponse.requires_clarification && llmResponse.suggested_bot_response && llmResponse.suggested_bot_response.includes("@mention")) {
-                    clarificationMessageText = llmResponse.suggested_bot_response; // LLM already crafted a good clarification request
+                    clarificationMessageText = llmResponse.suggested_bot_response;
                 } else if (llmResponse.requires_clarification && llmResponse.suggested_bot_response) {
-                    // If LLM wants clarification but didn't specifically ask for @mention, use its general clarification.
                     clarificationMessageText = llmResponse.suggested_bot_response;
                 } else {
-                    clarificationMessageText = "I understand you want to play with friends! To connect you, could you please @mention one of your friends in the guild in your next message?";
+                    clarificationMessageText = `I understand you want to play with friends! To connect you, could you please @mention one of your friends in the ${GUILD_NAME} guild in your next message?`; // Used GUILD_NAME
                 }
             }
             await channel.send(clarificationMessageText);
-            // This clarification message is the one we want in history for this step.
-            botResponseMessageContent = clarificationMessageText; 
+            await logBotMsgToHistory(clarificationMessageText, llmResponse); 
+            botResponseMessageContent = null; 
 
-            // Set up a new collector for the @mention
-            const mentionFilter = m => m.author.id === member.id;
-            const mentionCollector = channel.createMessageCollector({ filter: mentionFilter, max: 1, time: 2 * 60 * 1000 }); // 2 minutes for @mention
+            const mentionFilter = m => m.author.id === member.id && m.channel.id === channel.id;
+            const mentionCollector = channel.createMessageCollector({ filter: mentionFilter, max: 1, time: VOUCH_MENTION_CLARIFICATION_TIMEOUT_MS }); // Used config timer
 
             mentionCollector.on('collect', async (mentionMessage) => {
               console.log(`[RecruiterApp] VOUCH: Collected follow-up message for vouch: "${mentionMessage.content}"`);
-              // Log the user's @mention attempt to history
-              try {
-                await recruitmentCollection.updateOne(
-                  { userId: member.user.id },
-                  {
-                    $push: { messageHistory: { author: "user", content: mentionMessage.content, timestamp: mentionMessage.createdTimestamp } },
-                    $set: { lastActivityAt: Date.now() }
-                  }
-                );
-              } catch (dbError) { console.error("[RecruiterApp] VOUCH: DB error logging @mention response:", dbError); }
+              await messageHistoryCollection.insertOne({
+                  userId: member.id, channelId: channel.id, author: "user", 
+                  content: mentionMessage.content, timestamp: new Date(mentionMessage.createdTimestamp)
+              });
+              await recruitmentCollection.updateOne({ userId: member.id }, { $set: { lastActivityAt: new Date() } });
 
               const mentionedVoucherName = mentionMessage.content; 
-              const guild = member.guild;
               const mentionedVoucherMember = guild.members.cache.find(m => 
-                m.id === mentionedVoucherName.replace(/<@!?(\d+)>/g, '$1') || // Primarily check for actual mention ID
+                m.id === mentionedVoucherName.replace(/<@!?(\d+)>/g, '$1') || 
                 m.user.username.toLowerCase() === mentionedVoucherName.toLowerCase() || 
                 m.displayName.toLowerCase() === mentionedVoucherName.toLowerCase()
               );
 
               if (mentionedVoucherMember) {
                 console.log(`[RecruiterApp] VOUCH: Found potential voucher from @mention: ${mentionedVoucherMember.user.tag}`);
-                // We need to pass an llmResponse-like object to initiateVouchProcess.
-                const followUpLlmResponse = {
+                const currentLlmResponseForVouch = {
                     ...llmResponse, 
                     entities: {
                         ...llmResponse.entities,
@@ -483,87 +521,180 @@ async function processNewUser(member, database) {
                         original_vouch_text: llmResponse.entities?.original_vouch_text || mentionMessage.content
                     }
                 };
-                // Send a specific ack before starting vouch process, then log it.
                 const followUpAck = `Thanks! I found ${mentionedVoucherMember.user.tag}. Starting the vouch process now.`;
                 await channel.send(followUpAck);
-                try {
-                    await recruitmentCollection.updateOne(
-                      { userId: member.user.id },
-                      {
-                        $push: { messageHistory: { author: "bot", content: followUpAck, timestamp: Date.now() } },
-                        $set: { lastActivityAt: Date.now() }
-                      }
-                    );
-                } catch (dbError) { console.error("[RecruiterApp] VOUCH: DB error logging followUpAck:", dbError); }
+                await logBotMsgToHistory(followUpAck, currentLlmResponseForVouch); 
 
-                await initiateVouchProcess(member, mentionedVoucherMember, channel, followUpLlmResponse, recruitmentCollection);
+                await initiateVouchProcess(member, mentionedVoucherMember, channel, currentLlmResponseForVouch, recruitmentCollection, messageHistoryCollection);
               } else {
                 console.log(`[RecruiterApp] VOUCH: Still could not find voucher from follow-up message: "${mentionMessage.content}"`);
                 const noVoucherFoundMsg = "Sorry, I still couldn't identify a valid member from your message. A recruiter will need to assist you with the vouch process.";
                 await channel.send(noVoucherFoundMsg);
-                try {
-                    await recruitmentCollection.updateOne(
-                      { userId: member.user.id },
-                      {
-                        $push: { messageHistory: { author: "bot", content: noVoucherFoundMsg, timestamp: Date.now() } },
-                        $set: { lastActivityAt: Date.now() }
-                      }
-                    );
-                } catch (dbError) { console.error("[RecruiterApp] VOUCH: DB error logging noVoucherFoundMsg:", dbError); }
-                // TODO: Notify recruiters
+                await logBotMsgToHistory(noVoucherFoundMsg);
+                await notifyStaff(guild, `User ${member.user.tag} attempted vouch with '${mentionMessage.content}' but voucher was not found. Manual assistance needed in channel #${channel.name}.`, "VOUCH_CLARIFY_FAIL");
               }
             });
 
-            mentionCollector.on('end', (collectedMessages, reason) => {
+            mentionCollector.on('end', async (collectedMessages, reason) => {
               if (reason === 'time' && collectedMessages.size === 0) {
                 const timeoutMsg = "You didn't provide an @mention in time. If you still need help with a vouch, please ping a recruiter.";
-                channel.send(timeoutMsg).catch(console.error);
-                // Log timeout message to history
-                recruitmentCollection.updateOne(
-                    { userId: member.user.id },
-                    {
-                      $push: { messageHistory: { author: "bot", content: timeoutMsg, timestamp: Date.now() } },
-                      $set: { lastActivityAt: Date.now() }
-                    }
-                ).catch(dbError => console.error("[RecruiterApp] VOUCH: DB error logging mention timeout msg:", dbError));
+                await channel.send(timeoutMsg).catch(console.error);
+                await logBotMsgToHistory(timeoutMsg);
               }
             });
           }
-          performedComplexAction = true;
           break;
 
         case "GUILD_APPLICATION_INTEREST":
           console.log(`[RecruiterApp] Intent: GUILD_APPLICATION_INTEREST, Entities:`, llmResponse.entities);
-          botResponseMessageContent = llmResponse.suggested_bot_response || "Thanks for your interest in applying! Let me get you some information.";
-          // Future: guide through application questions or link to application form.
+          botResponseMessageContent = llmResponse.suggested_bot_response || `Thanks for your interest in applying to ${GUILD_NAME}! Let me get you some information.`; // Used GUILD_NAME
           await channel.send(botResponseMessageContent);
-          performedComplexAction = true; // Mark that we handled this intent specifically
           break;
 
         case "GENERAL_QUESTION":
           console.log(`[RecruiterApp] Intent: GENERAL_QUESTION, Entities:`, llmResponse.entities);
           botResponseMessageContent = llmResponse.suggested_bot_response || "That's a good question!";
-          // Future: try to answer from a knowledge base or use LLM to generate answer.
           await channel.send(botResponseMessageContent);
-          performedComplexAction = true;
           break;
 
-        // Add more cases for other intents as needed
-        // case "SOCIAL_GREETING":
-        // case "UNCLEAR_INTENT":
-        // case "OTHER":
-
-        default:
-          console.log(`[RecruiterApp] Intent: ${llmResponse.intent} (using default response)`);
+        default: 
+          console.log(`[RecruiterApp] Intent: ${llmResponse.intent} (processing in default/clarification path)`);
           botResponseMessageContent = llmResponse.suggested_bot_response;
+          let needsFollowUpCollector = false;
+
           if (!botResponseMessageContent) {
             console.warn(
               "[RecruiterApp] No suggested_bot_response from LLM or LLM failed for default case."
             );
             botResponseMessageContent =
               "I'm having a little trouble understanding that. A guild officer will be with you shortly to help.";
+          } else if (llmResponse.requires_clarification) {
+            needsFollowUpCollector = true;
+            console.log("[RecruiterApp] LLM requires clarification, will set up follow-up collector.");
           }
-          await channel.send(botResponseMessageContent);
+          
+          await channel.send(botResponseMessageContent); 
+
+          if (needsFollowUpCollector) {
+            await logBotMsgToHistory(botResponseMessageContent, llmResponse); 
+            botResponseMessageContent = null; 
+
+            const clarificationFilter = m => m.author.id === member.id && m.channel.id === channel.id;
+            const clarificationCollector = channel.createMessageCollector({ filter: clarificationFilter, max: 1, time: GENERAL_CLARIFICATION_TIMEOUT_MS }); // Used config timer
+
+            clarificationCollector.on('collect', async (clarificationMessage) => {
+              console.log(`[RecruiterApp] Collected clarification response: "${clarificationMessage.content}"`);
+              await messageHistoryCollection.insertOne({
+                  userId: member.id, channelId: channel.id, author: "user", 
+                  content: clarificationMessage.content, timestamp: new Date(clarificationMessage.createdTimestamp)
+              });
+              await recruitmentCollection.updateOne({ userId: member.id }, { $set: { lastActivityAt: new Date() } });
+
+              let updatedHistoryForLLM = [];
+              try {
+                const userHistory = await messageHistoryCollection.find(
+                    { userId: member.user.id, channelId: channel.id }
+                    ).sort({ timestamp: 1 }).toArray();
+                updatedHistoryForLLM = userHistory.map(histMsg => ({ role: histMsg.author === "user" ? "user" : "assistant", content: histMsg.content }));
+              } catch (dbError) { console.error("[RecruiterApp] Error fetching updated history for re-processing:", dbError); }
+
+              const followUpLlmResponse = await processUserMessageWithLLM(
+                clarificationMessage.content,
+                member.user.id,
+                updatedHistoryForLLM,
+                channel.id 
+              );
+              console.log("[RecruiterApp] LLM Response from clarification:", JSON.stringify(followUpLlmResponse, null, 2));
+              
+              let finalBotResponseFromClarification; 
+
+              switch (followUpLlmResponse?.intent) {
+                case "GUILD_APPLICATION_INTEREST":
+                  console.log(`[Clarification->Switch] User (${member.user.tag}) expressed GUILD_APPLICATION_INTEREST.`);
+                  finalBotResponseFromClarification = `Great! It sounds like you're interested in formally applying to join ${GUILD_NAME}. Let's start the process.`; // Used GUILD_NAME
+                  await channel.send(finalBotResponseFromClarification);
+                  await logBotMsgToHistory(finalBotResponseFromClarification, followUpLlmResponse);
+
+                  await recruitmentCollection.updateOne(
+                    { userId: member.id },
+                    { 
+                      $set: { 
+                        communityStatus: "APPLICATION_STARTED", 
+                        applicationIntent: followUpLlmResponse.intent,
+                        applicationDetails: followUpLlmResponse.entities,
+                        updatedAt: new Date()
+                      },
+                      $push: { 
+                        logs: { 
+                          timestamp: new Date(), 
+                          event: "Application process started after clarification.",
+                          llmResponse: followUpLlmResponse
+                        } 
+                      }
+                    }
+                  );
+                  await notifyStaff(
+                    guild, 
+                    `User ${member.user.tag} (${member.id}) has expressed interest in applying to the guild in channel #${channel.name}.`,
+                    "GUILD_APPLICATION_STARTED"
+                  );
+
+                  const firstQuestion = "To begin, could you please tell us about your primary in-game character name, class, and level?";
+                  await channel.send(firstQuestion);
+                  await logBotMsgToHistory(firstQuestion, {type: "APPLICATION_QUESTION_1"});
+                  
+                  const nextStepsMsg = "Once you've answered, a recruiter will review your initial interest. You can also use `/apply` to submit a full application if available.";
+                  await channel.send(nextStepsMsg);
+                  await logBotMsgToHistory(nextStepsMsg);
+                  break;
+
+                case "COMMUNITY_INTEREST_VOUCH":
+                  console.log("[RecruiterApp] Clarified intent: COMMUNITY_INTEREST_VOUCH. Attempting to start vouch process.");
+                  const clarifiedVouchPersonName = followUpLlmResponse.entities?.vouch_person_name;
+                  let clarifiedVoucherMember;
+
+                  if (clarifiedVouchPersonName) {
+                    clarifiedVoucherMember = guild.members.cache.find(m =>
+                      m.id === clarifiedVouchPersonName.replace(/<@!?(\d+)>/g, '$1') ||
+                      m.user.username.toLowerCase() === clarifiedVouchPersonName.toLowerCase() ||
+                      m.displayName.toLowerCase() === clarifiedVouchPersonName.toLowerCase()
+                    );
+                  }
+
+                  if (clarifiedVoucherMember) {
+                    finalBotResponseFromClarification = followUpLlmResponse.suggested_bot_response || `Thanks for clarifying! I found ${clarifiedVoucherMember.user.tag}. Starting the vouch process now.`;
+                    await channel.send(finalBotResponseFromClarification);
+                    await logBotMsgToHistory(finalBotResponseFromClarification, followUpLlmResponse);
+                    
+                    await initiateVouchProcess(member, clarifiedVoucherMember, channel, followUpLlmResponse, recruitmentCollection, messageHistoryCollection);
+                    finalBotResponseFromClarification = null; 
+                  } else {
+                    finalBotResponseFromClarification = followUpLlmResponse.suggested_bot_response || `You mentioned wanting a vouch for ${clarifiedVouchPersonName || 'someone'}, but I still couldn't identify them. Please ensure they are a member of this server. A recruiter can assist you.`;
+                    await channel.send(finalBotResponseFromClarification);
+                    await logBotMsgToHistory(finalBotResponseFromClarification, followUpLlmResponse);
+                    await notifyStaff(guild, `User ${member.user.tag} attempted vouch with '${clarificationMessage.content}' for '${clarifiedVouchPersonName || 'unknown'}' but voucher not found after clarification. Manual assistance needed in channel #${channel.name}.`, "VOUCH_CLARIFY_FAIL_FINAL");
+                  }
+                  break;
+
+                default: 
+                  finalBotResponseFromClarification = followUpLlmResponse?.suggested_bot_response || "Thanks for that information! A recruiter will review this and be with you if further steps are needed.";
+                  await channel.send(finalBotResponseFromClarification);
+                  await logBotMsgToHistory(finalBotResponseFromClarification, followUpLlmResponse);
+                  console.log("[RecruiterApp] Clarified intent was: ", followUpLlmResponse?.intent || "Unknown/Default");
+                  break;
+              }
+            });
+
+            clarificationCollector.on('end', async (collectedMsgs, reason) => {
+              if (reason === 'time' && collectedMsgs.size === 0) {
+                const timeoutClarMsg = "It looks like you didn't provide a clarification. If you still need assistance, please type your query again or ping a recruiter.";
+                await channel.send(timeoutClarMsg).catch(console.error);
+                await logBotMsgToHistory(timeoutClarMsg);
+              }
+            });
+          } else {
+             await logBotMsgToHistory(botResponseMessageContent, llmResponse);
+          }
           break;
       }
     } else {
@@ -573,46 +704,24 @@ async function processNewUser(member, database) {
       botResponseMessageContent =
         "I'm currently having some trouble processing requests. A guild officer will be with you shortly.";
       await channel.send(botResponseMessageContent);
-    }
-
-    // 5. Store bot's response in messageHistory, only if a complex action didn't already send one
-    //    OR if a complex action sent one, it should also handle its own history logging.
-    //    For now, the switch cases send messages, so we log the `botResponseMessageContent` used.
-    if (botResponseMessageContent) { // Ensure there is a message to log (and it wasn't nulled out by a complex handler)
-      try {
-        await recruitmentCollection.updateOne(
-          { userId: member.user.id },
-          {
-            $push: {
-              messageHistory: {
-                author: "bot",
-                content: botResponseMessageContent,
-                timestamp: Date.now(),
-              },
-            },
-            $set: { lastActivityAt: Date.now() } // Update last activity timestamp
-          }
-        );
-      } catch (dbError) {
-        console.error(
-          `Error updating message history with bot response for ${member.user.tag}:`,
-          dbError
-        );
-      }
+      await logBotMsgToHistory(botResponseMessageContent); 
     }
   });
 
-  collector.on("end", (collected, reason) => {
-    if (reason === "time" && collected.size === 0) { // Ensure no message was collected before timeout message
+  collector.on("end", async (collected, reason) => {
+    if (reason === "time" && collected.size === 0) { 
       console.log(
         `User ${member.user.tag} did not respond within the time limit.`
       );
-      // Optionally, send a follow-up message or alert a recruiter
-      channel
-        .send(
-          "It looks like you might be busy. Feel free to respond when you're ready, or a recruiter will check in with you later."
-        )
-        .catch(console.error);
+      const timeoutMsg = "It looks like you might be busy. Feel free to respond when you're ready, or a recruiter will check in with you later.";
+      if (channel && !channel.deleted) { 
+        try {
+            await channel.send(timeoutMsg);
+            await logBotMsgToHistory(timeoutMsg);
+        } catch (e) {
+            console.error(`Error sending timeout message to channel ${channel?.name}:`, e);
+        }
+      }
     }
   });
 }
@@ -622,8 +731,9 @@ async function processNewUser(member, database) {
  ********************************************/
 export default function onGuildMemberAdd(client, database) {
   client.on(Events.GuildMemberAdd, async (member) => {
-    // Optional: account-age check
-    // const wasKicked = await handleAccountAgeRestriction(member);
+    if (member.user.bot) return; 
+
+    // const wasKicked = await handleAccountAgeRestriction(member); // Uncomment to enable
     // if (wasKicked) return;
 
     const recruitmentCollection = database.collection("recruitment");
