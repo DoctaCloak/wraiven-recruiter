@@ -21,6 +21,7 @@ const ConversationStep = {
     GENERAL_LISTENING: 'GENERAL_LISTENING',
     VOUCH_PROCESS_ACTIVE: 'VOUCH_PROCESS_ACTIVE',
     APPLICATION_PROCESS_ACTIVE: 'APPLICATION_PROCESS_ACTIVE',
+    PROCESSING_INITIAL_RESPONSE: 'PROCESSING_INITIAL_RESPONSE',
 };
 
 
@@ -88,8 +89,15 @@ export default function onMessageCreate(client, database) {
     const { conversationState } = userData;
     const currentStep = conversationState.currentStep;
     const activeCollectorType = conversationState.activeCollectorType;
+    const lastProcessedMessageId = conversationState.lastDiscordMessageIdProcessed;
     
-    console.log(`[onMessageCreate] User ${userId}, Current Step: ${currentStep}, Active Collector: ${activeCollectorType}`);
+    console.log(`[onMessageCreate] User ${userId}, Current Step: ${currentStep}, Active Collector: ${activeCollectorType}, LastProcessedMsgID: ${lastProcessedMessageId}`);
+
+    // CRITICAL CHECK: If onGuildMemberAdd is currently processing this exact message, ignore it here.
+    if (currentStep === ConversationStep.PROCESSING_INITIAL_RESPONSE && lastProcessedMessageId === message.id) {
+        console.log(`[onMessageCreate] Message ${message.id} for user ${userId} is currently being processed by onGuildMemberAdd initial collector. Ignoring in onMessageCreate.`);
+        return;
+    }
 
     // Only rehydrate if the bot was expecting a message from the user in this state.
     // These are states where a collector would have been active.
