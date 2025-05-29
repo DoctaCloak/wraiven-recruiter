@@ -69,6 +69,10 @@ export async function initiateVouchProcess(
     `[VouchProcess] Initiating for ${newMember.user.tag} by ${voucherMember.user.tag} in #${processingChannel.name}`
   );
   const guild = newMember.guild;
+  const ConversationStep = { // Define locally for this utility or pass as arg if preferred
+    IDLE: 'IDLE',
+    VOUCH_PROCESS_ACTIVE: 'VOUCH_PROCESS_ACTIVE',
+  };
 
   try {
     await processingChannel.permissionOverwrites.edit(voucherMember.id, {
@@ -108,6 +112,19 @@ export async function initiateVouchProcess(
       time: VOUCH_REACTION_TIME_LIMIT, 
     });
 
+    // Update conversation state to VOUCH_PROCESS_ACTIVE
+    await recruitmentCollection.updateOne(
+      { userId: newMember.id }, 
+      { $set: { 
+          "conversationState.currentStep": ConversationStep.VOUCH_PROCESS_ACTIVE,
+          "conversationState.activeCollectorType": 'VOUCH_REACTION',
+          "conversationState.vouchInitiatorId": voucherMember.id, // Store who is being asked to vouch
+          "conversationState.stepEntryTimestamp": new Date(),
+          "conversationState.timeoutTimestamp": new Date(Date.now() + VOUCH_REACTION_TIME_LIMIT)
+        } 
+      }
+    );
+
     collector.on("collect", async (reaction, user) => {
       console.log(
         `[VouchProcess] Collected reaction: ${reaction.emoji.name} from ${user.tag}`
@@ -137,7 +154,18 @@ export async function initiateVouchProcess(
             // Channel is about to be deleted, so its ID should not persist in the active record.
             await recruitmentCollection.updateOne(
               { userId: newMember.id }, 
-              { $set: { communityStatus: "VOUCH_ACCEPTED", role: friendRole.name, vouchedBy: voucherMember.id, channelId: null } } 
+              { $set: { 
+                  communityStatus: "VOUCH_ACCEPTED", 
+                  role: friendRole.name, 
+                  vouchedBy: voucherMember.id, 
+                  channelId: null, 
+                  "conversationState.currentStep": ConversationStep.IDLE,
+                  "conversationState.stepEntryTimestamp": new Date(),
+                  "conversationState.activeCollectorType": null,
+                  "conversationState.timeoutTimestamp": null,
+                  "conversationState.vouchInitiatorId": null
+                } 
+              }
             );
             await processingChannel.delete(`Vouch accepted for ${newMember.user.tag}.`);
             channelDeleted = true;
@@ -164,7 +192,17 @@ export async function initiateVouchProcess(
         console.log(`[VouchProcess] ${voucherMember.user.tag} denied vouch for ${newMember.user.tag}`);
         await recruitmentCollection.updateOne(
             { userId: newMember.id }, 
-            { $set: { communityStatus: "VOUCH_DENIED", vouchedBy: voucherMember.id, channelId: null } }
+            { $set: { 
+                communityStatus: "VOUCH_DENIED", 
+                vouchedBy: voucherMember.id, 
+                channelId: null, 
+                "conversationState.currentStep": ConversationStep.IDLE,
+                "conversationState.stepEntryTimestamp": new Date(),
+                "conversationState.activeCollectorType": null,
+                "conversationState.timeoutTimestamp": null,
+                "conversationState.vouchInitiatorId": null
+              } 
+            }
         );
         await notifyStaff(guild, `${voucherMember.user.tag} denied vouch for ${newMember.user.tag} (${newMember.id}). Processing channel deleted.`, "VOUCH_DENIED");
         await processingChannel.delete(`Vouch denied for ${newMember.user.tag}.`);
@@ -192,7 +230,16 @@ export async function initiateVouchProcess(
             );
             await recruitmentCollection.updateOne(
                 { userId: newMember.id }, 
-                { $set: { communityStatus: "VOUCH_TIMEOUT", channelId: null } }
+                { $set: { 
+                    communityStatus: "VOUCH_TIMEOUT", 
+                    channelId: null, 
+                    "conversationState.currentStep": ConversationStep.IDLE,
+                    "conversationState.stepEntryTimestamp": new Date(),
+                    "conversationState.activeCollectorType": null,
+                    "conversationState.timeoutTimestamp": null,
+                    "conversationState.vouchInitiatorId": null
+                  } 
+                }
             );
             await notifyStaff(guild, `Vouch request for ${newMember.user.tag} (${newMember.id}) by ${voucherMember.user.tag} timed out. Processing channel deleted.`, "VOUCH_TIMEOUT");
             await processingChannel.delete(`Vouch timed out for ${newMember.user.tag}.`);
@@ -202,7 +249,16 @@ export async function initiateVouchProcess(
             // Ensure DB is updated even if channel was gone
             await recruitmentCollection.updateOne(
                 { userId: newMember.id }, 
-                { $set: { communityStatus: "VOUCH_TIMEOUT", channelId: null } }
+                { $set: { 
+                    communityStatus: "VOUCH_TIMEOUT", 
+                    channelId: null, 
+                    "conversationState.currentStep": ConversationStep.IDLE, // Ensure state is IDLE
+                    "conversationState.stepEntryTimestamp": new Date(),
+                    "conversationState.activeCollectorType": null,
+                    "conversationState.timeoutTimestamp": null,
+                    "conversationState.vouchInitiatorId": null
+                    } 
+                }
             ).catch(err => console.error("[VouchProcess] DB update error on timeout for already deleted channel:", err));
         }
       }
