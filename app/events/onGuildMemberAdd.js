@@ -392,35 +392,142 @@ async function processNewUser(member, database) {
       switch (llmResponse.intent) {
         case "COMMUNITY_INTEREST_VOUCH":
           console.log(`[RecruiterApp] Intent: COMMUNITY_INTEREST_VOUCH, Entities:`, llmResponse.entities);
-          botResponseMessageContent = llmResponse.suggested_bot_response || "Thanks for your interest in the community and mentioning a vouch!";
-          await channel.send(botResponseMessageContent);
           
-          if (llmResponse.entities && llmResponse.entities.vouch_person_name) {
-            const voucherName = llmResponse.entities.vouch_person_name;
-            const guild = member.guild; // Get guild from member
-            const voucherMember = guild.members.cache.find(m => 
-              m.user.username.toLowerCase() === voucherName.toLowerCase() || 
-              m.displayName.toLowerCase() === voucherName.toLowerCase() ||
-              m.id === voucherName.replace(/<@!?(\d+)>/g, '$1') // Extract ID from mention
-            );
+          const vouchPersonName = llmResponse.entities?.vouch_person_name;
+          let voucherMember; 
 
-            if (voucherMember) {
-              console.log(`[RecruiterApp] VOUCH: Found potential voucher: ${voucherMember.user.tag}`);
-              // Actually call the vouch process
-              await initiateVouchProcess(member, voucherMember, channel, llmResponse, recruitmentCollection);
-              // The initiateVouchProcess function will handle further user communication for this path.
-              // So, we might not need to set botResponseMessageContent here or log it again, 
-              // as that function handles its own interactions and DB logging for vouch specific messages.
-              // For simplicity, we'll clear it to prevent double logging of the initial LLM response.
-              botResponseMessageContent = null; 
-            } else {
-              console.log(`[RecruiterApp] VOUCH: Could not find voucher member by name/ID: ${voucherName}`);
-              botResponseMessageContent = `I see you mentioned ${voucherName}, but I couldn't find them in the server. Could you please @mention them directly?`;
-              await channel.send(botResponseMessageContent);
-            }
+          if (vouchPersonName) {
+            const guild = member.guild;
+            voucherMember = guild.members.cache.find(m => 
+              m.user.username.toLowerCase() === vouchPersonName.toLowerCase() || 
+              m.displayName.toLowerCase() === vouchPersonName.toLowerCase() ||
+              m.id === vouchPersonName.replace(/<@!?(\d+)>/g, '$1')
+            );
+          }
+
+          if (voucherMember) {
+            // Found voucher on first try
+            console.log(`[RecruiterApp] VOUCH: Found potential voucher on first attempt: ${voucherMember.user.tag}`);
+            // Send the LLM's response now that we know we have a valid voucher to reference
+            let initialVouchResponse = llmResponse.suggested_bot_response || `Thanks for letting me know you know ${voucherMember.user.tag}! I'll start the vouch process.`;
+            await channel.send(initialVouchResponse);
+            // Log this specific message to history, then nullify botResponseMessageContent before calling initiateVouchProcess
+            // as initiateVouchProcess will handle further distinct messages.
+            try {
+                await recruitmentCollection.updateOne(
+                  { userId: member.user.id },
+                  {
+                    $push: { messageHistory: { author: "bot", content: initialVouchResponse, timestamp: Date.now() } },
+                    $set: { lastActivityAt: Date.now() }
+                  }
+                );
+            } catch (dbError) { console.error("[RecruiterApp] VOUCH: DB error logging initial vouch ack:", dbError); }
+            
+            await initiateVouchProcess(member, voucherMember, channel, llmResponse, recruitmentCollection);
+            botResponseMessageContent = null; // Vouch process handles its own messages from here
           } else {
-            botResponseMessageContent = "You mentioned a vouch, but I couldn't quite catch who that was. Could you please @mention them so I can connect you?";
-            await channel.send(botResponseMessageContent);
+            // Voucher not found or not specified clearly by LLM, ask for @mention
+            let clarificationMessageText = "";
+            if (vouchPersonName) { // LLM provided a name, but we couldn't find them
+                console.log(`[RecruiterApp] VOUCH: Could not find voucher member by name/ID: ${vouchPersonName} from initial LLM response.`);
+                clarificationMessageText = `I see you mentioned ${vouchPersonName}, but I couldn't find them in the server. Could you please @mention them directly in your next message?`;
+            } else { // LLM likely set vouch_person_name to null (e.g., for "friends")
+                console.log("[RecruiterApp] VOUCH: vouch_person_name was null or unclear from LLM. Asking for @mention.");
+                // Use suggested_bot_response if it already asks for clarification, or a default.
+                if (llmResponse.requires_clarification && llmResponse.suggested_bot_response && llmResponse.suggested_bot_response.includes("@mention")) {
+                    clarificationMessageText = llmResponse.suggested_bot_response; // LLM already crafted a good clarification request
+                } else if (llmResponse.requires_clarification && llmResponse.suggested_bot_response) {
+                    // If LLM wants clarification but didn't specifically ask for @mention, use its general clarification.
+                    clarificationMessageText = llmResponse.suggested_bot_response;
+                } else {
+                    clarificationMessageText = "I understand you want to play with friends! To connect you, could you please @mention one of your friends in the guild in your next message?";
+                }
+            }
+            await channel.send(clarificationMessageText);
+            // This clarification message is the one we want in history for this step.
+            botResponseMessageContent = clarificationMessageText; 
+
+            // Set up a new collector for the @mention
+            const mentionFilter = m => m.author.id === member.id;
+            const mentionCollector = channel.createMessageCollector({ filter: mentionFilter, max: 1, time: 2 * 60 * 1000 }); // 2 minutes for @mention
+
+            mentionCollector.on('collect', async (mentionMessage) => {
+              console.log(`[RecruiterApp] VOUCH: Collected follow-up message for vouch: "${mentionMessage.content}"`);
+              // Log the user's @mention attempt to history
+              try {
+                await recruitmentCollection.updateOne(
+                  { userId: member.user.id },
+                  {
+                    $push: { messageHistory: { author: "user", content: mentionMessage.content, timestamp: mentionMessage.createdTimestamp } },
+                    $set: { lastActivityAt: Date.now() }
+                  }
+                );
+              } catch (dbError) { console.error("[RecruiterApp] VOUCH: DB error logging @mention response:", dbError); }
+
+              const mentionedVoucherName = mentionMessage.content; 
+              const guild = member.guild;
+              const mentionedVoucherMember = guild.members.cache.find(m => 
+                m.id === mentionedVoucherName.replace(/<@!?(\d+)>/g, '$1') || // Primarily check for actual mention ID
+                m.user.username.toLowerCase() === mentionedVoucherName.toLowerCase() || 
+                m.displayName.toLowerCase() === mentionedVoucherName.toLowerCase()
+              );
+
+              if (mentionedVoucherMember) {
+                console.log(`[RecruiterApp] VOUCH: Found potential voucher from @mention: ${mentionedVoucherMember.user.tag}`);
+                // We need to pass an llmResponse-like object to initiateVouchProcess.
+                const followUpLlmResponse = {
+                    ...llmResponse, 
+                    entities: {
+                        ...llmResponse.entities,
+                        vouch_person_name: mentionedVoucherMember.user.tag, 
+                        original_vouch_text: llmResponse.entities?.original_vouch_text || mentionMessage.content
+                    }
+                };
+                // Send a specific ack before starting vouch process, then log it.
+                const followUpAck = `Thanks! I found ${mentionedVoucherMember.user.tag}. Starting the vouch process now.`;
+                await channel.send(followUpAck);
+                try {
+                    await recruitmentCollection.updateOne(
+                      { userId: member.user.id },
+                      {
+                        $push: { messageHistory: { author: "bot", content: followUpAck, timestamp: Date.now() } },
+                        $set: { lastActivityAt: Date.now() }
+                      }
+                    );
+                } catch (dbError) { console.error("[RecruiterApp] VOUCH: DB error logging followUpAck:", dbError); }
+
+                await initiateVouchProcess(member, mentionedVoucherMember, channel, followUpLlmResponse, recruitmentCollection);
+              } else {
+                console.log(`[RecruiterApp] VOUCH: Still could not find voucher from follow-up message: "${mentionMessage.content}"`);
+                const noVoucherFoundMsg = "Sorry, I still couldn't identify a valid member from your message. A recruiter will need to assist you with the vouch process.";
+                await channel.send(noVoucherFoundMsg);
+                try {
+                    await recruitmentCollection.updateOne(
+                      { userId: member.user.id },
+                      {
+                        $push: { messageHistory: { author: "bot", content: noVoucherFoundMsg, timestamp: Date.now() } },
+                        $set: { lastActivityAt: Date.now() }
+                      }
+                    );
+                } catch (dbError) { console.error("[RecruiterApp] VOUCH: DB error logging noVoucherFoundMsg:", dbError); }
+                // TODO: Notify recruiters
+              }
+            });
+
+            mentionCollector.on('end', (collectedMessages, reason) => {
+              if (reason === 'time' && collectedMessages.size === 0) {
+                const timeoutMsg = "You didn't provide an @mention in time. If you still need help with a vouch, please ping a recruiter.";
+                channel.send(timeoutMsg).catch(console.error);
+                // Log timeout message to history
+                recruitmentCollection.updateOne(
+                    { userId: member.user.id },
+                    {
+                      $push: { messageHistory: { author: "bot", content: timeoutMsg, timestamp: Date.now() } },
+                      $set: { lastActivityAt: Date.now() }
+                    }
+                ).catch(dbError => console.error("[RecruiterApp] VOUCH: DB error logging mention timeout msg:", dbError));
+              }
+            });
           }
           performedComplexAction = true;
           break;
@@ -471,7 +578,7 @@ async function processNewUser(member, database) {
     // 5. Store bot's response in messageHistory, only if a complex action didn't already send one
     //    OR if a complex action sent one, it should also handle its own history logging.
     //    For now, the switch cases send messages, so we log the `botResponseMessageContent` used.
-    if (botResponseMessageContent) { // Ensure there is a message to log
+    if (botResponseMessageContent) { // Ensure there is a message to log (and it wasn't nulled out by a complex handler)
       try {
         await recruitmentCollection.updateOne(
           { userId: member.user.id },
