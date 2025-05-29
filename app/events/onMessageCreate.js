@@ -247,28 +247,32 @@ export default function onMessageCreate(client, database) {
         
         console.log("[onMessageCreate] Rehydrated LLM Response Received:", JSON.stringify(rehydratedLlmResponse, null, 2));
 
-        // Send LLM's immediate response (if any) and log it
-        if (rehydratedLlmResponse && rehydratedLlmResponse.suggested_bot_response) {
-            await message.channel.send(rehydratedLlmResponse.suggested_bot_response).catch(async sendErr => {
-                console.error(`[onMessageCreate] Error sending rehydrated LLM response: ${sendErr}`)
-                await notifyStaff(guild, `Error sending LLM response for ${member.user.tag} during rehydration. Error: ${sendErr.message}`, "LLM_SEND_ERROR_REHYDRATE").catch(console.error);
-            });
-            await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, member.user.id, message.channel.id, rehydratedLlmResponse.suggested_bot_response, rehydratedLlmResponse);
-            // Update history for the loop to include the bot's response
-            conversationHistoryForLLM.push({ role: "assistant", content: rehydratedLlmResponse.suggested_bot_response });
-        } else if (!rehydratedLlmResponse || rehydratedLlmResponse.error) {
-            // If LLM had an error or no response, log and potentially send a generic message
-            const fallbackMsg = "I'm having a little trouble processing that. Let me try to get back on track.";
-            if(!rehydratedLlmResponse?.error?.includes("NO_API_KEY")) { // Avoid spamming if key is missing
-              await message.channel.send(fallbackMsg).catch(console.error);
-            }
-            await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, member.user.id, message.channel.id, fallbackMsg, rehydratedLlmResponse);
-            conversationHistoryForLLM.push({ role: "assistant", content: fallbackMsg });
-            if (rehydratedLlmResponse?.error) {
-                 await notifyStaff(guild, `LLM Error for ${member.user.tag} during rehydration: ${rehydratedLlmResponse.error}. User was in step: ${currentStep}`, "LLM_ERROR_REHYDRATE").catch(console.error);
-            }
-        }
+        // --- MODIFICATION: Commenting out direct message sending and history update from onMessageCreate ---
+        // // Send LLM's immediate response (if any) and log it
+        // if (rehydratedLlmResponse && rehydratedLlmResponse.suggested_bot_response) {
+        //     await message.channel.send(rehydratedLlmResponse.suggested_bot_response).catch(async sendErr => {
+        //         console.error(`[onMessageCreate] Error sending rehydrated LLM response: ${sendErr}`)
+        //         await notifyStaff(guild, `Error sending LLM response for ${member.user.tag} during rehydration. Error: ${sendErr.message}`, "LLM_SEND_ERROR_REHYDRATE").catch(console.error);
+        //     });
+        //     await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, member.user.id, message.channel.id, rehydratedLlmResponse.suggested_bot_response, rehydratedLlmResponse);
+        //     // Update history for the loop to include the bot's response
+        //     conversationHistoryForLLM.push({ role: "assistant", content: rehydratedLlmResponse.suggested_bot_response });
+        // } else if (!rehydratedLlmResponse || rehydratedLlmResponse.error) {
+        //     // If LLM had an error or no response, log and potentially send a generic message
+        //     const fallbackMsg = "I'm having a little trouble processing that. Let me try to get back on track.";
+        //     if(!rehydratedLlmResponse?.error?.includes("NO_API_KEY")) { // Avoid spamming if key is missing
+        //       await message.channel.send(fallbackMsg).catch(console.error);
+        //     }
+        //     await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, member.user.id, message.channel.id, fallbackMsg, rehydratedLlmResponse);
+        //     conversationHistoryForLLM.push({ role: "assistant", content: fallbackMsg });
+        //     if (rehydratedLlmResponse?.error) {
+        //          await notifyStaff(guild, `LLM Error for ${member.user.tag} during rehydration: ${rehydratedLlmResponse.error}. User was in step: ${currentStep}`, "LLM_ERROR_REHYDRATE").catch(console.error);
+        //     }
+        // }
         // If LLM has no response but no error, it might be a silent action or handled by the loop structure itself.
+        // conversationHistoryForLLM passed to handleClarificationLoop will now end with the user's last message.
+        // handleClarificationLoop will be responsible for sending the bot's reply, logging it, and updating its own copy of the history.
+        // --- END MODIFICATION ---
 
         // Determine the attempt count for the rehydrated loop.
         // If the previous state was AWAITING_CLARIFICATION, increment its attempt count.
@@ -283,22 +287,25 @@ export default function onMessageCreate(client, database) {
             }
         } 
 
-        // Update DB state based on rehydratedLlmResponse before entering the loop
-        await recruitmentCollection.updateOne({ userId: member.id, channelId: message.channel.id }, { $set: { 
-            "conversationState.currentStep": rehydratedLlmResponse?.requires_clarification ? ConversationStep.AWAITING_CLARIFICATION : ConversationStep.GENERAL_LISTENING,
-            "conversationState.lastLlmIntent": rehydratedLlmResponse?.intent,
-            "conversationState.stepEntryTimestamp": new Date(),
-            "conversationState.timeoutTimestamp": new Date(Date.now() + GENERAL_CLARIFICATION_TIMEOUT_MS), // Reset timeout
-            "conversationState.activeCollectorType": rehydratedLlmResponse?.requires_clarification ? 'CLARIFICATION' : 'GENERAL',
-            "conversationState.attemptCount": nextAttemptCount
-        } });
+        // --- MODIFICATION: Commenting out premature state update. handleClarificationLoop should manage this. ---
+        // // Update DB state based on rehydratedLlmResponse before entering the loop
+        // await recruitmentCollection.updateOne({ userId: member.id, channelId: message.channel.id }, { $set: { 
+        //     "conversationState.currentStep": rehydratedLlmResponse?.requires_clarification ? ConversationStep.AWAITING_CLARIFICATION : ConversationStep.GENERAL_LISTENING,
+        //     "conversationState.lastLlmIntent": rehydratedLlmResponse?.intent,
+        //     "conversationState.stepEntryTimestamp": new Date(),
+        //     "conversationState.timeoutTimestamp": new Date(Date.now() + GENERAL_CLARIFICATION_TIMEOUT_MS), // Reset timeout
+        //     "conversationState.activeCollectorType": rehydratedLlmResponse?.requires_clarification ? 'CLARIFICATION' : 'GENERAL',
+        //     "conversationState.attemptCount": nextAttemptCount
+        // } });
+        // --- END MODIFICATION ---
 
         // Now, call the main loop.
+        // conversationHistoryForLLM currently includes the user's new message, but NOT the bot's response to it yet.
         await handleClarificationLoop(
             member,
             message.channel,
             rehydratedLlmResponse,      // The LLM response to the user's current message
-            conversationHistoryForLLM, // History now includes user's current message + bot's immediate response
+            conversationHistoryForLLM, // History up to user's current message
             recruitmentCollection,
             messageHistoryCollection,
             guild,
