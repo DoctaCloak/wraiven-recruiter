@@ -1,38 +1,66 @@
 import fs from "fs";
 import path from "node:path";
-
 import { REST, Routes } from "discord.js";
-import { config } from "dotenv";
+import dotenv from "dotenv"; // Changed from 'config' to 'dotenv' for consistency
 
-config();
+// Load environment variables from .env file at the root of the project
+const __dirname = path.dirname(new URL(import.meta.url).pathname);
+// Assuming deploy-commands.js is in the root of the 'recruiter' app, 
+// and .env is in the parent directory (workspace root)
+const envPath = path.resolve(__dirname, '../.env'); 
+dotenv.config({ path: envPath });
+
 const { APP_ID, DISCORD_TOKEN, GUILD_ID } = process.env;
 
-// const { clientId, guildId, token } = require("./config.json");
+// Validate essential environment variables
+if (!APP_ID || !DISCORD_TOKEN || !GUILD_ID) {
+  console.error("Error: Missing essential environment variables (APP_ID, DISCORD_TOKEN, or GUILD_ID).");
+  console.error("Please ensure your .env file is correctly set up in the project root.");
+  process.exit(1); // Exit if essential vars are missing
+}
 
 const commands = [];
 
-const ROOT_DIR = process.cwd();
+const ROOT_DIR = process.cwd(); // This should be /usr/src/app in Docker
+const commandsPath = path.join(ROOT_DIR, "app/commands"); 
 
-// Path to the commands directory
-const commandsPath = path.join(ROOT_DIR, "app/commands");
-const commandFiles = fs
-  .readdirSync(commandsPath)
-  .filter((file) => file.endsWith(".js"));
+console.log(`[DeployCommands] Looking for command files in: ${commandsPath}`);
+
+let commandFiles = [];
+try {
+    commandFiles = fs
+        .readdirSync(commandsPath)
+        .filter((file) => file.endsWith(".js"));
+} catch (error) {
+    console.error(`[DeployCommands] Error reading commands directory at ${commandsPath}:`, error);
+    process.exit(1);
+}
+
+if (commandFiles.length === 0) {
+    console.warn(`[DeployCommands] No command files found in ${commandsPath}. Nothing to register.`);
+} else {
+    console.log(`[DeployCommands] Found command files: ${commandFiles.join(', ')}`);
+}
 
 // Grab the SlashCommandBuilder#toJSON() output of each command's data for deployment
 for (const file of commandFiles) {
   const filePath = path.join(commandsPath, file);
-  // Dynamically import the command module
-  // Ensure your Node version supports top-level await or run this in an async function if not.
-  const commandModule = await import(`file://${filePath}`);
-  const command = commandModule.default; // Adjust if your command modules export differently
+  try {
+    // Dynamically import the command module
+    const commandModule = await import(`file://${filePath}`);
+    // Adjust if your command modules export differently (e.g., commandModule.commandData if not default)
+    const command = commandModule.default || commandModule.command; 
 
-  if (command && "data" in command && "execute" in command) {
-    commands.push(command.data.toJSON());
-  } else {
-    console.log(
-      `[WARNING] The command at ${filePath} is missing a required "data" or "execute" property.`
-    );
+    if (command && command.data && typeof command.data.toJSON === 'function') {
+      commands.push(command.data.toJSON());
+      console.log(`[DeployCommands] Successfully loaded command from ${file}`);
+    } else {
+      console.warn(
+        `[WARNING] The command at ${filePath} is missing a required "data" property with a toJSON method, or the module structure is unexpected.`
+      );
+    }
+  } catch (error) {
+    console.error(`[ERROR] Failed to load command at ${filePath}:`, error);
   }
 }
 
@@ -41,9 +69,13 @@ const rest = new REST().setToken(DISCORD_TOKEN);
 
 // and deploy your commands!
 (async () => {
+  if (commands.length === 0) {
+    console.log("[DeployCommands] No valid commands were loaded. Skipping deployment to Discord.");
+    return;
+  }
   try {
     console.log(
-      `Started refreshing ${commands.length} application (/) commands.`
+      `[DeployCommands] Started refreshing ${commands.length} application (/) commands for guild ${GUILD_ID}.`
     );
 
     // The put method is used to fully refresh all commands in the guild with the current set
@@ -53,10 +85,9 @@ const rest = new REST().setToken(DISCORD_TOKEN);
     );
 
     console.log(
-      `Successfully reloaded ${data.length} application (/) commands.`
+      `[DeployCommands] Successfully reloaded ${data.length} application (/) commands.`
     );
   } catch (error) {
-    // And of course, make sure you catch and log any errors!
-    console.error(error);
+    console.error("[DeployCommands] Error during command deployment to Discord:", error);
   }
 })();

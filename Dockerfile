@@ -14,7 +14,7 @@ RUN npm ci
 # Copy the rest of the application code
 COPY . .
 
-# Install slash commands
+# Install slash commands (during build phase - good for a baseline)
 RUN npm run register
 
 # Application port (if any)
@@ -24,5 +24,5 @@ RUN npm run register
 # ENV VAR_NAME=value
 
 # Command to run the application
-# Replace main.js with your actual main script file, or use 'npm start'
-CMD [ "node", "app.js" ] 
+# This will now run command registration AND then start the app on every container start.
+CMD sh -c "npm run register && node app.js" 
