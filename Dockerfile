@@ -14,9 +14,6 @@ RUN npm ci
 # Copy the rest of the application code
 COPY . .
 
-# Install slash commands (during build phase - good for a baseline)
-RUN npm run register
-
 # Application port (if any)
 # EXPOSE 3000
 
