@@ -101,7 +101,7 @@ async function handleAccountAgeRestriction(member) {
  * Ensures we have (or create) a category (e.g. "City Gates").
  * Returns the category channel, or null if creation fails.
  */
-async function ensureCategory(guild, categoryName) {
+export async function ensureCategory(guild, categoryName) {
   let category = guild.channels.cache.find(
     (ch) => ch.type === ChannelType.GuildCategory && ch.name === categoryName
   );
@@ -190,7 +190,7 @@ async function ensureUserProcessingChannel(
  * Builds permission overwrites for a "processing" channel,
  * granting the specified member (and relevant roles) the needed access.
  */
-function buildProcessingChannelPermissions(member, guild) {
+export function buildProcessingChannelPermissions(member, guild) {
   // Look up roles by name (storing IDs is usually better in production).
   const recruiterRole = guild.roles.cache.find(
     (role) => role.name === rolesMap.get("RECRUITER")
