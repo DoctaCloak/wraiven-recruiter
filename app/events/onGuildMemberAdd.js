@@ -548,55 +548,79 @@ async function processNewUser(member, database) {
   initialMsgCollector.on("collect", async (message) => {
     console.log(`[RecruiterApp] Collected first message from ${member.user.tag}: "${message.content}"`);
     
-    // Immediately update state to PROCESSING_INITIAL_RESPONSE to avoid race with onMessageCreate
-    // And record the ID of the message being processed.
     try {
         const processingStateUpdate = {
             "conversationState.currentStep": ConversationStep.PROCESSING_INITIAL_RESPONSE,
             "conversationState.lastDiscordMessageIdProcessed": message.id,
             "conversationState.stepEntryTimestamp": new Date(),
-            "conversationState.activeCollectorType": null, // Collector is done, now processing
-            // Keep timeout for LLM processing, but it's less critical now as we have the message
-            "conversationState.timeoutTimestamp": new Date(Date.now() + GENERAL_CLARIFICATION_TIMEOUT_MS * 2), // Give ample time for LLM + HCL
+            "conversationState.activeCollectorType": null, 
+            "conversationState.timeoutTimestamp": new Date(Date.now() + GENERAL_CLARIFICATION_TIMEOUT_MS * 2),
         };
         await recruitmentCollection.updateOne({ userId: member.id }, { $set: processingStateUpdate });
         console.log(`[RecruiterApp] DB updated for ${member.user.tag}: step = PROCESSING_INITIAL_RESPONSE, lastDiscordMessageIdProcessed = ${message.id}`);
     } catch (dbError) {
         console.error(`[RecruiterApp] CRITICAL: Failed to update state to PROCESSING_INITIAL_RESPONSE for ${member.user.tag}, message ${message.id}:`, dbError);
-        // If this fails, onMessageCreate might still pick it up, or it might get stuck.
-        // For now, log and continue, hoping handleClarificationLoop can recover or onMessageCreate handles it.
+        // Attempt to recover by setting to IDLE if this critical update fails, to avoid getting stuck.
+        await recruitmentCollection.updateOne(
+            { userId: member.id }, 
+            { $set: { 
+                "conversationState.currentStep": ConversationStep.IDLE,
+                "conversationState.activeCollectorType": null,
+                "conversationState.lastDiscordMessageIdProcessed": message.id, // still note that we saw this message
+                "conversationState.lastLlmIntent": "ERROR_SETTING_PROCESSING_STEP",
+            } }
+        ).catch(finalDbError => console.error("[RecruiterApp] Failed to set IDLE state after failing to set PROCESSING_INITIAL_RESPONSE:", finalDbError));
+        // Don't return here, let the rest of the try block attempt to run, but state might be inconsistent.
     }
 
-    // Log user's message to history
-    // Ensure this happens *after* state update for race condition handling, though order usually doesn't matter for logging.
-    await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, member.user.id, currentChannelId, message.content, message.id);
-    conversationHistoryForLLM.push({ role: "user", content: message.content });
+    try { // New try-catch for LLM and handleClarificationLoop
+        await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, member.user.id, currentChannelId, message.content, message.id);
+        conversationHistoryForLLM.push({ role: "user", content: message.content });
 
-    const firstLlmResponse = await processUserMessageWithLLM(
-      message.content,
-      conversationHistoryForLLM, // Pass the current history
-      member.user.username,
-      member.id
-    );
-    console.log("[RecruiterApp] First LLM Response Received:", JSON.stringify(firstLlmResponse, null, 2));
+        const firstLlmResponse = await processUserMessageWithLLM(
+          message.content,
+          conversationHistoryForLLM, 
+          member.user.username,
+          member.id
+        );
+        console.log("[RecruiterApp] First LLM Response Received:", JSON.stringify(firstLlmResponse, null, 2));
 
-    // Update history for the loop to include the user's first message.
-    // handleClarificationLoop will add the bot's response to the history it maintains.
-    const historyForLoopStart = [...conversationHistoryForLLM]; // Starts with bot welcome + user's first message
+        const historyForLoopStart = [...conversationHistoryForLLM];
 
-    // Now, hand off to the unified clarification loop
-    // The loop will set the next state based on LLM response (AWAITING_CLARIFICATION or GENERAL_LISTENING)
-    await handleClarificationLoop(
-        member,
-        channel,
-        firstLlmResponse,
-        historyForLoopStart,
-        recruitmentCollection,
-        messageHistoryCollection,
-        member.guild,
-        0, // attemptCount starts at 0 for the first "real" processing round
-        message.id // Pass the user's message ID
-    );
+        await handleClarificationLoop(
+            member,
+            channel,
+            firstLlmResponse,
+            historyForLoopStart,
+            recruitmentCollection,
+            messageHistoryCollection,
+            member.guild,
+            0, 
+            message.id 
+        );
+    } catch (error) {
+        console.error(`[RecruiterApp] Error during initial LLM processing or handleClarificationLoop for ${member.user.tag}:`, error);
+        await notifyStaff(member.guild, `Critical error during initial processing for ${member.user.tag} in channel <#${currentChannelId}>. User may be stuck. Error: ${error.message}`, "INITIAL_PROCESSING_ERROR").catch(console.error);
+        try {
+            if (channel && !channel.deleted) {
+                await channel.send("I encountered an unexpected issue while processing your first message. Please try sending another message, or a staff member will be notified to assist.").catch(console.error);
+            }
+        } catch (e) {console.error("Failed to send error message to user channel", e);}
+        // Attempt to reset state to IDLE to allow onMessageCreate to pick up next message
+        await recruitmentCollection.updateOne(
+            { userId: member.id }, 
+            { $set: { 
+                "conversationState.currentStep": ConversationStep.IDLE,
+                "conversationState.activeCollectorType": null,
+                // lastDiscordMessageIdProcessed is already set to this message.id
+                "conversationState.lastLlmIntent": "ERROR_DURING_INITIAL_HCL",
+                "conversationState.timeoutTimestamp": null,
+                "conversationState.attemptCount": 0
+            } }
+        ).catch(dbUpdateError => {
+            console.error(`[RecruiterApp] Failed to update state to IDLE after error for ${member.user.tag}:`, dbUpdateError);
+        });
+    }
   });
 
   initialMsgCollector.on("end", async (collected, reason) => {
