@@ -14,9 +14,6 @@ RUN npm ci
 # Copy the rest of the application code
 COPY . .
 
-# Install slash commands (during build phase - good for a baseline)
-RUN npm run register
-
 # Application port (if any)
 # EXPOSE 3000
 
@@ -25,4 +22,4 @@ RUN npm run register
 
 # Command to run the application
 # Replace main.js with your actual main script file, or use 'npm start'
-CMD [ "node", "app.js" ] 
+CMD [ "npm", "run", "register", "&&", "node", "app.js" ] 
