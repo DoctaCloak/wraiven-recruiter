@@ -64,9 +64,25 @@ export default function onMessageCreate(client, database) {
         return;
     }
     if (!userData.conversationState) {
-        console.log(`[onMessageCreate] User data for userId: ${userId} found and channel matches, but conversationState is MISSING. No rehydration.`);
-        console.log(`[onMessageCreate] Faulty userData:`, JSON.stringify(userData, null, 2));
-        return;
+        console.log(`[onMessageCreate] User data for userId: ${userId} found and channel matches, but conversationState is MISSING. Initializing it now.`);
+        userData.conversationState = {
+            currentStep: ConversationStep.IDLE, // Start them at IDLE, the loop will take over
+            stepEntryTimestamp: new Date(),
+            timeoutTimestamp: null, 
+            activeCollectorType: null,
+            attemptCount: 0,
+            lastLlmIntent: null
+        };
+        try {
+            await recruitmentCollection.updateOne(
+                { userId: userId }, 
+                { $set: { conversationState: userData.conversationState, lastActivityAt: new Date() } }
+            );
+            console.log(`[onMessageCreate] Successfully initialized conversationState for userId: ${userId}`);
+        } catch (dbError) {
+            console.error(`[onMessageCreate] Failed to update DB with initialized conversationState for userId: ${userId}`, dbError);
+            // Don't return yet, try to proceed with the in-memory initialized state for this interaction.
+        }
     }
 
     const { conversationState } = userData;
