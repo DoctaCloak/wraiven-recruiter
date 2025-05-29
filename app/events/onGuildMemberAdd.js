@@ -30,6 +30,7 @@ const VOUCH_MENTION_CLARIFICATION_TIMEOUT_MS = config.TIMERS.VOUCH_MENTION_CLARI
 const GENERAL_CLARIFICATION_TIMEOUT_MS = config.TIMERS.GENERAL_CLARIFICATION_MINUTES * 60 * 1000;
 
 const MAX_CLARIFICATION_ATTEMPTS = 3;
+const PLACEHOLDER_EMPTY_CONTENT = "<message content not available>"; // Placeholder
 
 const ACCESS_STATUS = {
   PENDING: "PENDING",
@@ -327,6 +328,8 @@ async function processRejoiningUser(member, userData, recruitmentCollection) {
     rejoiningMsgCollector.on("collect", async (message) => {
         console.log(`[RecruiterApp] Collected message from rejoining user ${member.user.tag}: "${message.content}"`);
         
+        const validatedUserContent = (message.content && message.content.trim() !== "") ? message.content : PLACEHOLDER_EMPTY_CONTENT;
+
         // Update state to PROCESSING_INITIAL_RESPONSE for rejoining user as well
         try {
             const processingStateUpdate = {
@@ -343,8 +346,8 @@ async function processRejoiningUser(member, userData, recruitmentCollection) {
         }
 
 
-        await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, member.id, currentChannelId, message.content, message.id);
-        conversationHistoryForLLM.push({ role: "user", content: message.content });
+        await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, member.id, currentChannelId, validatedUserContent, message.id);
+        conversationHistoryForLLM.push({ role: "user", content: validatedUserContent });
         
         // Fetch more complete history for rejoining user for LLM context
         try {
@@ -354,7 +357,7 @@ async function processRejoiningUser(member, userData, recruitmentCollection) {
             
             const fullHistoryForLLM = allUserHistoryEntries.map(entry => ({
                 role: entry.author === 'user' ? 'user' : 'assistant',
-                content: entry.messageContent
+                content: (entry.messageContent && entry.messageContent.trim() !== "") ? entry.messageContent : PLACEHOLDER_EMPTY_CONTENT
             }));
             // The latest user message is already pushed, ensure no duplicates if history fetch overlaps
             // For simplicity, LLM can handle slight repetition if it occurs.
@@ -367,7 +370,7 @@ async function processRejoiningUser(member, userData, recruitmentCollection) {
 
 
         const llmResponse = await processUserMessageWithLLM(
-            message.content,
+            validatedUserContent,
             conversationHistoryForLLM,
             member.user.username,
             member.id
@@ -548,6 +551,8 @@ async function processNewUser(member, database) {
   initialMsgCollector.on("collect", async (message) => {
     console.log(`[RecruiterApp] Collected first message from ${member.user.tag}: "${message.content}"`);
     
+    const validatedUserContent = (message.content && message.content.trim() !== "") ? message.content : PLACEHOLDER_EMPTY_CONTENT;
+
     try {
         const processingStateUpdate = {
             "conversationState.currentStep": ConversationStep.PROCESSING_INITIAL_RESPONSE,
@@ -574,11 +579,11 @@ async function processNewUser(member, database) {
     }
 
     try { // New try-catch for LLM and handleClarificationLoop
-        await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, member.user.id, currentChannelId, message.content, message.id);
-        conversationHistoryForLLM.push({ role: "user", content: message.content });
+        await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, member.user.id, currentChannelId, validatedUserContent, message.id);
+        conversationHistoryForLLM.push({ role: "user", content: validatedUserContent });
 
         const firstLlmResponse = await processUserMessageWithLLM(
-          message.content,
+          validatedUserContent,
           conversationHistoryForLLM, 
           member.user.username,
           member.id
@@ -913,10 +918,11 @@ export async function handleClarificationLoop(
 
         clarificationCollector.on("collect", async (m) => {
           console.log(`[ClarificationCollector] Collected: "${m.content}" from ${userId} in channel ${m.channel.name}`);
-          await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channelId, m.content, m.id); // Log user message
-          conversationHistoryForLLM.push({ role: "user", content: m.content });
+          const validatedClarificationContent = (m.content && m.content.trim() !== "") ? m.content : PLACEHOLDER_EMPTY_CONTENT;
+          await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channelId, validatedClarificationContent, m.id); // Log user message
+          conversationHistoryForLLM.push({ role: "user", content: validatedClarificationContent });
 
-          const followUpLlmResponse = await processUserMessageWithLLM(m.content, conversationHistoryForLLM, member.user.username, userId);
+          const followUpLlmResponse = await processUserMessageWithLLM(validatedClarificationContent, conversationHistoryForLLM, member.user.username, userId);
           await handleClarificationLoop(member, channel, followUpLlmResponse, conversationHistoryForLLM, recruitmentCollection, messageHistoryCollection, guild, attemptCount + 1, m.id);
         });
 
@@ -949,10 +955,11 @@ export async function handleClarificationLoop(
           console.log(`[GeneralListenerCollector] Collected: "${m.content}" from ${userId} in ${m.channel.name}`);
           generalListenerCollector.stop("newMessage"); // Stop this collector, new one will be made by HCL recursion
           
-          await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channelId, m.content, m.id);
-          conversationHistoryForLLM.push({ role: "user", content: m.content });
+          const validatedGeneralContent = (m.content && m.content.trim() !== "") ? m.content : PLACEHOLDER_EMPTY_CONTENT;
+          await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channelId, validatedGeneralContent, m.id);
+          conversationHistoryForLLM.push({ role: "user", content: validatedGeneralContent });
 
-          const followUpLlmResponse = await processUserMessageWithLLM(m.content, conversationHistoryForLLM, member.user.username, userId);
+          const followUpLlmResponse = await processUserMessageWithLLM(validatedGeneralContent, conversationHistoryForLLM, member.user.username, userId);
           await handleClarificationLoop(member, channel, followUpLlmResponse, conversationHistoryForLLM, recruitmentCollection, messageHistoryCollection, guild, 0, m.id); // Reset attemptCount for new general interaction
         });
 
@@ -1029,11 +1036,12 @@ export async function handleClarificationLoop(
 
         vouchMentionCollector.on("collect", async (m) => {
           console.log(`[VouchMentionCollector] Collected: "${m.content}" from ${userId}`);
-          await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channelId, m.content, m.id);
-          conversationHistoryForLLM.push({ role: "user", content: m.content });
+          const validatedVouchContent = (m.content && m.content.trim() !== "") ? m.content : PLACEHOLDER_EMPTY_CONTENT;
+          await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channelId, validatedVouchContent, m.id);
+          conversationHistoryForLLM.push({ role: "user", content: validatedVouchContent });
 
           // Reprocess with LLM to extract mention or confirm intent with new info.
-          const vouchLlmResponse = await processUserMessageWithLLM(m.content, conversationHistoryForLLM, member.user.username, userId);
+          const vouchLlmResponse = await processUserMessageWithLLM(validatedVouchContent, conversationHistoryForLLM, member.user.username, userId);
           await handleClarificationLoop(member, channel, vouchLlmResponse, conversationHistoryForLLM, recruitmentCollection, messageHistoryCollection, guild, attemptCount + 1, m.id);
         });
 
@@ -1095,9 +1103,10 @@ export async function handleClarificationLoop(
           generalListenerCollector.on("collect", async (m) => {
             console.log(`[GeneralListenerCollector-DefaultCase] Collected: "${m.content}" from ${userId} in ${m.channel.name}`);
             generalListenerCollector.stop("newMessage");
-            await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channelId, m.content, m.id);
-            conversationHistoryForLLM.push({ role: "user", content: m.content });
-            const followUpLlmResponse = await processUserMessageWithLLM(m.content, conversationHistoryForLLM, member.user.username, userId);
+            const validatedDefaultGeneralContent = (m.content && m.content.trim() !== "") ? m.content : PLACEHOLDER_EMPTY_CONTENT;
+            await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channelId, validatedDefaultGeneralContent, m.id);
+            conversationHistoryForLLM.push({ role: "user", content: validatedDefaultGeneralContent });
+            const followUpLlmResponse = await processUserMessageWithLLM(validatedDefaultGeneralContent, conversationHistoryForLLM, member.user.username, userId);
             await handleClarificationLoop(member, channel, followUpLlmResponse, conversationHistoryForLLM, recruitmentCollection, messageHistoryCollection, guild, 0, m.id);
           });
     

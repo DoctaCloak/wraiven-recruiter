@@ -11,6 +11,7 @@ const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
 
 const PROCESSING_CHANNEL_PREFIX = config.CHANNEL_PREFIXES?.RECRUITMENT_PROCESSING || "processing-";
 const GENERAL_CLARIFICATION_TIMEOUT_MS = config.TIMERS.GENERAL_CLARIFICATION_MINUTES * 60 * 1000;
+const PLACEHOLDER_EMPTY_CONTENT = "<message content not available>"; // Placeholder for empty/null content
 
 const ConversationStep = { 
     IDLE: 'IDLE',
@@ -32,11 +33,14 @@ export default function onMessageCreate(client, database) {
     const guild = message.guild;
     if (!guild) return; 
 
+    // Validate message content early, used for logging and processing
+    const currentMessageContent = (message.content && message.content.trim() !== "") ? message.content : PLACEHOLDER_EMPTY_CONTENT;
+
     if (!message.channel.name || !message.channel.name.startsWith(PROCESSING_CHANNEL_PREFIX)) {
         return;
     }
     
-    console.log(`[onMessageCreate] Received message from ${message.author.tag} in ${message.channel.name}: "${message.content}"`);
+    console.log(`[onMessageCreate] Received message from ${message.author.tag} in ${message.channel.name}: "${currentMessageContent}" (Original: "${message.content}")`);
 
     const recruitmentCollection = database.collection("recruitment");
     const messageHistoryCollection = database.collection("messageHistory");
@@ -46,11 +50,9 @@ export default function onMessageCreate(client, database) {
     let userData = await recruitmentCollection.findOne({ userId: userId });
 
     if (userData) {
-        console.log(`[onMessageCreate] User data FOUND for userId: ${userId}. Full data:`, JSON.stringify(userData, null, 2));
+        console.log(`[onMessageCreate] User data FOUND for userId: ${userId}.`); // Removed full data log for brevity
         if (userData.channelId !== message.channel.id) {
             console.warn(`[onMessageCreate] User ${userId} record has channelId '${userData.channelId}', but message is from channel '${message.channel.id}'. Mismatch.`);
-            // For safety, nullify userData to prevent rehydration with a mismatched channel context for now.
-            // Depending on desired behavior, one might update userData.channelId here if this new channel should become primary.
             userData = null; 
         } else {
             console.log(`[onMessageCreate] User ${userId} record channelId '${userData.channelId}' matches message channelId '${message.channel.id}'.`);
@@ -59,7 +61,6 @@ export default function onMessageCreate(client, database) {
         console.log(`[onMessageCreate] User data NOT FOUND for userId: ${userId} in recruitmentCollection.`);
     }
 
-    // Proceed only if userData is still valid (exists, channel matches, and has conversationState)
     if (!userData) {
         console.log(`[onMessageCreate] User data invalid or channel mismatch for userId: ${userId}, channelId: ${message.channel.id}. No rehydration.`);
         return;
@@ -67,12 +68,13 @@ export default function onMessageCreate(client, database) {
     if (!userData.conversationState) {
         console.log(`[onMessageCreate] User data for userId: ${userId} found and channel matches, but conversationState is MISSING. Initializing it now.`);
         userData.conversationState = {
-            currentStep: ConversationStep.IDLE, // Start them at IDLE, the loop will take over
+            currentStep: ConversationStep.IDLE, 
             stepEntryTimestamp: new Date(),
             timeoutTimestamp: null, 
             activeCollectorType: null,
             attemptCount: 0,
-            lastLlmIntent: null
+            lastLlmIntent: null,
+            lastDiscordMessageIdProcessed: null // Ensure this is part of init
         };
         try {
             await recruitmentCollection.updateOne(
@@ -82,7 +84,6 @@ export default function onMessageCreate(client, database) {
             console.log(`[onMessageCreate] Successfully initialized conversationState for userId: ${userId}`);
         } catch (dbError) {
             console.error(`[onMessageCreate] Failed to update DB with initialized conversationState for userId: ${userId}`, dbError);
-            // Don't return yet, try to proceed with the in-memory initialized state for this interaction.
         }
     }
 
@@ -93,19 +94,16 @@ export default function onMessageCreate(client, database) {
     
     console.log(`[onMessageCreate] User ${userId}, Current Step: ${currentStep}, Active Collector: ${activeCollectorType}, LastProcessedMsgID: ${lastProcessedMessageId}`);
 
-    // CRITICAL CHECK: If onGuildMemberAdd is currently processing this exact message, ignore it here.
     if (currentStep === ConversationStep.PROCESSING_INITIAL_RESPONSE && lastProcessedMessageId === message.id) {
         console.log(`[onMessageCreate] Message ${message.id} for user ${userId} is currently being processed by onGuildMemberAdd initial collector. Ignoring in onMessageCreate.`);
         return;
     }
 
-    // Only rehydrate if the bot was expecting a message from the user in this state.
-    // These are states where a collector would have been active.
     if (currentStep === ConversationStep.AWAITING_CLARIFICATION || 
         currentStep === ConversationStep.AWAITING_VOUCH_MENTION || 
         currentStep === ConversationStep.AWAITING_APPLICATION_ANSWER || 
         currentStep === ConversationStep.GENERAL_LISTENING ||
-        (currentStep === ConversationStep.IDLE && activeCollectorType === null) // A general message when bot is idle in channel
+        (currentStep === ConversationStep.IDLE && activeCollectorType === null) 
        ) {
         
         console.log(`[onMessageCreate] Rehydrating conversation for ${userId} at step ${currentStep}.`);
@@ -131,85 +129,77 @@ export default function onMessageCreate(client, database) {
             return;
         }
 
-        // Create a set of known message identifiers from the DB to help avoid duplicates
-        // Assuming dbMessages store discordMessageId. If not, this check will be less effective.
         const knownMessageIds = new Set(dbMessages.map(msg => msg.discordMessageId).filter(id => id));
-
         let recentDiscordMessages = new Collection();
         try {
-            recentDiscordMessages = await message.channel.messages.fetch({ limit: 30 }); // Fetch last 30 messages
+            recentDiscordMessages = await message.channel.messages.fetch({ limit: 30 }); 
         } catch (fetchError) {
             console.error(`[onMessageCreate] Error fetching recent messages from Discord channel ${message.channel.id}:`, fetchError);
-            // Not a fatal error for rehydration, we can proceed with DB messages, but log it.
             await notifyStaff(guild, `Error fetching recent messages from Discord channel for ${member.user.tag}. Error: ${fetchError.message}`, "DISCORD_FETCH_ERROR_REHYDRATE").catch(console.error);
         }
 
         const messagesToSaveToDb = [];
-        const allMessagesTemp = [...dbMessages]; // Start with DB messages
+        const allMessagesTemp = dbMessages.map(dbMsg => ({ // Ensure content from DB is also validated
+            ...dbMsg,
+            content: (dbMsg.messageContent && dbMsg.messageContent.trim() !== "") ? dbMsg.messageContent : PLACEHOLDER_EMPTY_CONTENT
+        })); 
 
-        // Iterate Discord messages (they come newest to oldest, so reverse for chronological processing)
         for (const discordMsg of recentDiscordMessages.reverse().values()) {
-            if (knownMessageIds.has(discordMsg.id)) {
-                continue; // Already have this message from DB
-            }
-            // Heuristic: if discordMessageId wasn't stored or matched, double check content and rough time
-            // This is imperfect and ideally replaced by consistent discordMessageId storage.
-            const roughlySameTimeAndContent = dbMessages.find(dbMsg => 
-                Math.abs(new Date(dbMsg.timestamp).getTime() - discordMsg.createdTimestamp) < 2000 && // within 2 secs
-                dbMsg.content === discordMsg.content &&
-                ((discordMsg.author.id === userId && dbMsg.author === 'user') || (discordMsg.author.bot && discordMsg.author.id === client.user.id && dbMsg.author === 'bot'))
+            if (knownMessageIds.has(discordMsg.id)) continue;
+            
+            const msgContent = (discordMsg.content && discordMsg.content.trim() !== "") ? discordMsg.content : PLACEHOLDER_EMPTY_CONTENT;
+
+            const roughlySameTimeAndContent = allMessagesTemp.find(tempMsg => 
+                Math.abs(new Date(tempMsg.timestamp).getTime() - discordMsg.createdTimestamp) < 2000 && 
+                tempMsg.content === msgContent && // Compare with validated content
+                ((discordMsg.author.id === userId && tempMsg.author === 'user') || (discordMsg.author.bot && discordMsg.author.id === client.user.id && tempMsg.author === 'bot'))
             );
-            if (roughlySameTimeAndContent && !dbMessages.find(dbm => dbm.discordMessageId === discordMsg.id)){
-                //Likely the same message but discordMessageId was not stored. Update the DB entry.
-                if(roughlySameTimeAndContent._id){
+            if (roughlySameTimeAndContent && !allMessagesTemp.find(dbm => dbm.discordMessageId === discordMsg.id)){
+                if(roughlySameTimeAndContent._id && !roughlySameTimeAndContent.discordMessageId){
                     messageHistoryCollection.updateOne({_id: roughlySameTimeAndContent._id}, {$set: {discordMessageId: discordMsg.id}}).catch(err => console.error("Error updating discordMessageId", err));
-                    knownMessageIds.add(discordMsg.id); // Add it now that we've linked it
+                    knownMessageIds.add(discordMsg.id); 
                 }
                 continue;
             }
             if (roughlySameTimeAndContent) continue;
 
-
             const formattedMissedMessage = {
                 discordMessageId: discordMsg.id,
-                userId: userId, // The user whose conversation this is
+                userId: userId, 
                 channelId: discordMsg.channel.id,
                 author: discordMsg.author.id === userId ? "user" : (discordMsg.author.bot && discordMsg.author.id === client.user.id ? "bot" : "other_user_or_bot"),
-                content: discordMsg.content,
+                content: msgContent, // Use validated content
+                messageContent: msgContent, // For DB storage consistency with logBotMsgToHistory
                 timestamp: new Date(discordMsg.createdTimestamp),
-                llm_response_object: null, // Missed messages wouldn't have this initially
+                llm_response_object: null, 
                 savedFromDiscordFetch: true
             };
 
-            // Only process/save if it's from the current user or the bot itself for this conversation context
             if (formattedMissedMessage.author === "user" || formattedMissedMessage.author === "bot") {
                 allMessagesTemp.push(formattedMissedMessage);
-                messagesToSaveToDb.push(formattedMissedMessage);
-                knownMessageIds.add(discordMsg.id); // Add to known IDs after processing
+                // Prepare for DB: use messageContent field as per logBotMsgToHistory
+                const dbEntry = {...formattedMissedMessage}; 
+                delete dbEntry.content; // remove 'content' if it was just for LLM prep, rely on messageContent
+                messagesToSaveToDb.push(dbEntry);
+                knownMessageIds.add(discordMsg.id); 
             }
         }
 
-        // Sort all collected messages by timestamp
         allMessagesTemp.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
         
-        // Asynchronously save the newly found messages to the database
         if (messagesToSaveToDb.length > 0) {
             console.log(`[onMessageCreate] Saving ${messagesToSaveToDb.length} missed messages to DB for user ${userId}.`);
             messageHistoryCollection.insertMany(messagesToSaveToDb, { ordered: false }).catch(err => {
                 console.error(`[onMessageCreate] Error bulk saving missed messages to DB for ${userId}:`, err);
-                // Individual errors might occur if a message somehow got saved between fetch and insertMany (e.g. race condition)
             });
         }
 
-        // This is the history for the LLM, from combined sources, sorted.
-        let conversationHistoryForLLM;
         conversationHistoryForLLM = allMessagesTemp.map(msg => ({
-            role: msg.author === "user" ? "user" : "assistant", // Map 'bot' to 'assistant' for LLM
-            content: msg.content
-        }));
+            role: msg.author === "user" ? "user" : "assistant", 
+            // content field here should be the one used for LLM, which we validated earlier as msg.content or dbMsg.messageContent
+            content: (msg.content && msg.content.trim() !== "") ? msg.content : ((msg.messageContent && msg.messageContent.trim() !== "") ? msg.messageContent : PLACEHOLDER_EMPTY_CONTENT)
+        }));        
         
-        // Log the new incoming message (message that triggered onMessageCreate) to history BEFORE passing to LLM
-        // Ensure this current message isn't already in allMessagesTemp from the fetch (if fetch was very fast)
         if (!knownMessageIds.has(message.id)) {
             try {
                 const currentUserMessageEntry = {
@@ -217,107 +207,57 @@ export default function onMessageCreate(client, database) {
                     userId: member.user.id,
                     channelId: message.channel.id,
                     author: "user",
-                    content: message.content,
+                    messageContent: currentMessageContent, // Use validated content for DB
                     timestamp: new Date(message.createdTimestamp),
-                    savedFromDiscordFetch: false // This is the triggering message
+                    savedFromDiscordFetch: false 
                 };
                 await messageHistoryCollection.insertOne(currentUserMessageEntry);
                 await recruitmentCollection.updateOne(
                     { userId: member.user.id, channelId: message.channel.id }, 
                     { $set: { lastActivityAt: new Date() } }
                 );
-                conversationHistoryForLLM.push({ role: "user", content: message.content });
-                // No need to add to knownMessageIds here as it's the current message, not part of historical fetch merge
+                conversationHistoryForLLM.push({ role: "user", content: currentMessageContent }); // Use validated content for LLM history
             } catch (dbError) {
                 console.error(`[onMessageCreate] Error saving current user message to history for ${member.user.tag}:`, dbError);
                 await message.channel.send("I had a small hiccup recording your current message. Please try sending it again. If this persists, contact staff.").catch(console.error);
                 return; 
             }
         } else {
-             // Current message was already captured by the fetch (e.g. if bot restarted very quickly after message was sent)
-             // Ensure it's the last one in conversationHistoryForLLM if it was part of allMessagesTemp
             const lastMsgInHistory = conversationHistoryForLLM[conversationHistoryForLLM.length -1];
-            if (!lastMsgInHistory || lastMsgInHistory.content !== message.content || lastMsgInHistory.role !== 'user'){    
-                //This should not happen if knownMessageIds.has(message.id) is true and allMessagesTemp was built correctly
-                //But as a fallback, ensure the current message is correctly represented as the last user message.
-                console.warn("[onMessageCreate] Current message was in knownMessageIds but not last in history. Appending.")
-                conversationHistoryForLLM.push({ role: "user", content: message.content });
+            if (!lastMsgInHistory || (lastMsgInHistory.content !== currentMessageContent && lastMsgInHistory.content !== PLACEHOLDER_EMPTY_CONTENT) || lastMsgInHistory.role !== 'user'){    
+                console.warn("[onMessageCreate] Current message was in knownMessageIds but not last in history or content mismatch. Appending validated content.")
+                conversationHistoryForLLM.push({ role: "user", content: currentMessageContent }); // Use validated content
             }
         }
 
-        // Now, process this new message with the LLM
         const rehydratedLlmResponse = await processUserMessageWithLLM(
-            message.content,
-            member.user.id,
-            conversationHistoryForLLM, // This now includes the current message
-            message.channel.id
+            currentMessageContent, // Use validated content for the primary message to LLM
+            conversationHistoryForLLM, 
+            member.user.username, // Changed from member.user.id as per llm_utils.js expectation
+            member.id             // Added member.id as per llm_utils.js expectation
         );
         
         console.log("[onMessageCreate] Rehydrated LLM Response Received:", JSON.stringify(rehydratedLlmResponse, null, 2));
 
-        // --- MODIFICATION: Commenting out direct message sending and history update from onMessageCreate ---
-        // // Send LLM's immediate response (if any) and log it
-        // if (rehydratedLlmResponse && rehydratedLlmResponse.suggested_bot_response) {
-        //     await message.channel.send(rehydratedLlmResponse.suggested_bot_response).catch(async sendErr => {
-        //         console.error(`[onMessageCreate] Error sending rehydrated LLM response: ${sendErr}`)
-        //         await notifyStaff(guild, `Error sending LLM response for ${member.user.tag} during rehydration. Error: ${sendErr.message}`, "LLM_SEND_ERROR_REHYDRATE").catch(console.error);
-        //     });
-        //     await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, member.user.id, message.channel.id, rehydratedLlmResponse.suggested_bot_response, rehydratedLlmResponse);
-        //     // Update history for the loop to include the bot's response
-        //     conversationHistoryForLLM.push({ role: "assistant", content: rehydratedLlmResponse.suggested_bot_response });
-        // } else if (!rehydratedLlmResponse || rehydratedLlmResponse.error) {
-        //     // If LLM had an error or no response, log and potentially send a generic message
-        //     const fallbackMsg = "I'm having a little trouble processing that. Let me try to get back on track.";
-        //     if(!rehydratedLlmResponse?.error?.includes("NO_API_KEY")) { // Avoid spamming if key is missing
-        //       await message.channel.send(fallbackMsg).catch(console.error);
-        //     }
-        //     await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, member.user.id, message.channel.id, fallbackMsg, rehydratedLlmResponse);
-        //     conversationHistoryForLLM.push({ role: "assistant", content: fallbackMsg });
-        //     if (rehydratedLlmResponse?.error) {
-        //          await notifyStaff(guild, `LLM Error for ${member.user.tag} during rehydration: ${rehydratedLlmResponse.error}. User was in step: ${currentStep}`, "LLM_ERROR_REHYDRATE").catch(console.error);
-        //     }
-        // }
-        // If LLM has no response but no error, it might be a silent action or handled by the loop structure itself.
-        // conversationHistoryForLLM passed to handleClarificationLoop will now end with the user's last message.
-        // handleClarificationLoop will be responsible for sending the bot's reply, logging it, and updating its own copy of the history.
-        // --- END MODIFICATION ---
-
-        // Determine the attempt count for the rehydrated loop.
-        // If the previous state was AWAITING_CLARIFICATION, increment its attempt count.
-        // Otherwise, if the new LLM response requires clarification, start at 1.
-        // If no clarification needed, it's 0.
         let nextAttemptCount = 0;
         if (rehydratedLlmResponse?.requires_clarification) {
             if (currentStep === ConversationStep.AWAITING_CLARIFICATION && activeCollectorType === 'CLARIFICATION') {
                 nextAttemptCount = (conversationState.attemptCount || 0) + 1;
             } else {
-                nextAttemptCount = 1; // Start a new clarification cycle
+                nextAttemptCount = 1; 
             }
         } 
 
-        // --- MODIFICATION: Commenting out premature state update. handleClarificationLoop should manage this. ---
-        // // Update DB state based on rehydratedLlmResponse before entering the loop
-        // await recruitmentCollection.updateOne({ userId: member.id, channelId: message.channel.id }, { $set: { 
-        //     "conversationState.currentStep": rehydratedLlmResponse?.requires_clarification ? ConversationStep.AWAITING_CLARIFICATION : ConversationStep.GENERAL_LISTENING,
-        //     "conversationState.lastLlmIntent": rehydratedLlmResponse?.intent,
-        //     "conversationState.stepEntryTimestamp": new Date(),
-        //     "conversationState.timeoutTimestamp": new Date(Date.now() + GENERAL_CLARIFICATION_TIMEOUT_MS), // Reset timeout
-        //     "conversationState.activeCollectorType": rehydratedLlmResponse?.requires_clarification ? 'CLARIFICATION' : 'GENERAL',
-        //     "conversationState.attemptCount": nextAttemptCount
-        // } });
-        // --- END MODIFICATION ---
-
-        // Now, call the main loop.
-        // conversationHistoryForLLM currently includes the user's new message, but NOT the bot's response to it yet.
         await handleClarificationLoop(
             member,
             message.channel,
-            rehydratedLlmResponse,      // The LLM response to the user's current message
-            conversationHistoryForLLM, // History up to user's current message
+            rehydratedLlmResponse,      
+            conversationHistoryForLLM, 
             recruitmentCollection,
             messageHistoryCollection,
             guild,
-            nextAttemptCount           // Use the calculated attempt count
+            nextAttemptCount,           
+            message.id // Pass current message ID to HCL
         );
     } else {
         console.log(`[onMessageCreate] User ${userId} in step ${currentStep} with collector ${activeCollectorType}. No direct message rehydration action defined for this combination currently.`);
