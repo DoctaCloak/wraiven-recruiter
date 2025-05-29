@@ -24,5 +24,5 @@ RUN npm run register
 # ENV VAR_NAME=value
 
 # Command to run the application
-# This will now run command registration AND then start the app on every container start.
-CMD sh -c "npm run register && node app.js" 
+# Replace main.js with your actual main script file, or use 'npm start'
+CMD [ "node", "register", "node","app.js" ] 
