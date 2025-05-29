@@ -231,10 +231,9 @@ export default function onMessageCreate(client, database) {
         }
 
         const rehydratedLlmResponse = await processUserMessageWithLLM(
-            currentMessageContent, // Use validated content for the primary message to LLM
-            member.user.username, // Changed from member.user.id as per llm_utils.js expectation
-            member.id,             // Added member.id as per llm_utils.js expectation
-            conversationHistoryForLLM 
+            currentMessageContent, // 1. userMessage
+            member.id,             // 2. userId
+            conversationHistoryForLLM // 3. conversationHistory
         );
         
         console.log("[onMessageCreate] Rehydrated LLM Response Received:", JSON.stringify(rehydratedLlmResponse, null, 2));
