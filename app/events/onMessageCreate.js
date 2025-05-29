@@ -194,7 +194,7 @@ export default function onMessageCreate(client, database) {
             });
         }
 
-        conversationHistoryForLLM = allMessagesTemp.map(msg => ({
+        let conversationHistoryForLLM = allMessagesTemp.map(msg => ({
             role: msg.author === "user" ? "user" : "assistant", 
             // content field here should be the one used for LLM, which we validated earlier as msg.content or dbMsg.messageContent
             content: (msg.content && msg.content.trim() !== "") ? msg.content : ((msg.messageContent && msg.messageContent.trim() !== "") ? msg.messageContent : PLACEHOLDER_EMPTY_CONTENT)
