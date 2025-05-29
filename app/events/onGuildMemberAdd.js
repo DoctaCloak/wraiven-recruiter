@@ -1,4 +1,4 @@
-import { Events, PermissionsBitField, ChannelType } from "discord.js";
+import { Events, PermissionsBitField, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
 import fs from 'fs';
 import path from 'path';
 // import { getAccountRestrictionEmbed } from "./utils/onGuildMemberAdd.js"; // This utility was self-contained or needs to be re-evaluated
@@ -601,14 +601,10 @@ export async function handleClarificationLoop(
   let nextStep = ConversationStep.GENERAL_LISTENING;
   let nextCollectorType = 'GENERAL';
   let nextTimeoutMs = GENERAL_CLARIFICATION_TIMEOUT_MS;
-  let currentQuestionIndex = userData?.conversationState?.applicationQuestionIndex;
   
   if (currentIntent === "GUILD_APPLICATION_INTEREST" && !requiresClarification) {
-    // If intent is application and no clarification, it means we are in Q&A mode or starting it.
-    if (typeof currentQuestionIndex !== 'number') currentQuestionIndex = 0; // Start at Q0 if not set
-    // The actual question sending and index increment happens in the switch case.
-    nextStep = ConversationStep.AWAITING_APPLICATION_ANSWER;
-    nextCollectorType = 'APPLICATION_QNA';
+    nextStep = ConversationStep.GENERAL_LISTENING;
+    nextCollectorType = 'GENERAL'; 
   } else if (requiresClarification) {
     nextStep = ConversationStep.AWAITING_CLARIFICATION;
     nextCollectorType = 'CLARIFICATION';
@@ -645,7 +641,7 @@ export async function handleClarificationLoop(
       activeCollectorType: nextCollectorType,
       attemptCount: requiresClarification ? attemptCount : 0, 
       lastLlmIntent: currentIntent,
-      applicationQuestionIndex: currentQuestionIndex 
+      applicationQuestionIndex: null
   };
 
   try {
@@ -653,14 +649,14 @@ export async function handleClarificationLoop(
           { userId: userId, channelId: channel.id },
           { $set: { conversationState: newConversationState, lastActivityAt: new Date() } }
       );
-      console.log(`[handleClarificationLoop] Updated DB state for ${userId} to: ${nextStep}, collector: ${nextCollectorType}, intent: ${currentIntent}, q_idx: ${newConversationState.applicationQuestionIndex}`);
+      console.log(`[handleClarificationLoop] Updated DB state for ${userId} to: ${nextStep}, collector: ${nextCollectorType}, intent: ${currentIntent}`);
       userData = await recruitmentCollection.findOne({ userId: userId, channelId: channel.id }); // Refresh userData after update
   } catch (dbError) {
       console.error(`[handleClarificationLoop] Failed to update conversationState in DB for ${userId}`, dbError);
   }
 
   // 3. Main logic based on LLM intent
-  console.log(`[handleClarificationLoop] Processing intent: ${currentIntent} for ${userId}, Requires Clarification: ${requiresClarification}, Q_idx: ${currentQuestionIndex}`);
+  console.log(`[handleClarificationLoop] Processing intent: ${currentIntent} for ${userId}, Requires Clarification: ${requiresClarification}`);
 
   if (requiresClarification && attemptCount >= MAX_CLARIFICATION_ATTEMPTS) {
     console.log(`[handleClarificationLoop] Max clarification attempts reached for ${userId}.`);
@@ -675,19 +671,8 @@ export async function handleClarificationLoop(
     return; 
   }
 
-  const applicationQuestions = config.APPLICATION_QUESTIONS || [
-    { key: "ign_class_experience", question: "To start, what is your main character's in-game name, primary class, and general experience with Albion Online?" },
-    { key: "timezone_playstyle", question: "Great! Could you also share your timezone and preferred playstyle (e.g., PvPer, crafter, gatherer, jack-of-all-trades)?" },
-    { key: "goals_expectations", question: "What are your goals in Albion Online, and what do you expect from joining Wraiven?" },
-    { key: "pvp_experience_type", question: "Can you describe your PvP experience? What kind of PvP activities do you enjoy most (e.g., ZvZ, ganking, Crystals, Hellgates, faction warfare)?" },
-    { key: "why_wraiven", question: "Why Wraiven specifically? What makes you interested in our guild?" },
-    { key: "availability_voice", question: "What's your general availability (days/times), and are you comfortable using Discord for voice comms during guild activities?" },
-    { key: "questions_for_us", question: "Do you have any questions for us about the guild, our activities, or anything else?" }
-  ];
-
   switch (currentIntent) {
     case "UNCLEAR_INTENT": // This case is primarily for when requiresClarification is true
-    case "GENERAL_QUESTION": 
       if (requiresClarification) {
         console.log(`[handleClarificationLoop] Setting up CLARIFICATION collector for ${userId}. Attempt ${attemptCount + 1}`);
         // Message asking for clarification was already sent at the top.
@@ -752,147 +737,83 @@ export async function handleClarificationLoop(
       break;
 
     case "GUILD_APPLICATION_INTEREST":
-      console.log(`[handleClarificationLoop] Intent: GUILD_APPLICATION_INTEREST for ${userId}. Current Q_idx: ${currentQuestionIndex}`);
-      let applicationData = userData?.applicationData || {};
+      if (!requiresClarification) { // Only proceed if LLM confirms application interest and no clarification needed
+        console.log(`[handleClarificationLoop] Intent: GUILD_APPLICATION_INTEREST for ${userId}. Preparing to send ticket button.`);
 
-      // If currentLlmResponse is not for clarification, it means we might be processing an answer.
-      // The user's answer is the last user message in conversationHistoryForLLM.
-      if (!requiresClarification && currentQuestionIndex > 0 && conversationHistoryForLLM.length > 1) {
-          // The bot just spoke (currentLlmResponse.suggested_bot_response), so user's answer is before that.
-          const lastUserMessageIndex = conversationHistoryForLLM.length - 2; 
-          const lastUserMessage = conversationHistoryForLLM[lastUserMessageIndex];
-          if (lastUserMessage && lastUserMessage.role === 'user') {
-              const answeredQuestionKey = applicationQuestions[currentQuestionIndex -1]?.key;
-              if (answeredQuestionKey && !applicationData[answeredQuestionKey]) { // Store if not already stored
-                  applicationData[answeredQuestionKey] = lastUserMessage.content;
-                  console.log(`[handleClarificationLoop] Stored answer for Q${currentQuestionIndex-1} (${answeredQuestionKey}): "${lastUserMessage.content}"`);
-                  // Save applicationData immediately with the new answer
-                  await recruitmentCollection.updateOne({ userId: userId, channelId: channel.id }, { $set: { applicationData: applicationData } });
-              }
-          }
-      }
+        const ticketButton = new ButtonBuilder()
+            .setCustomId('open_recruitment_ticket')
+            .setLabel('Open Recruitment Ticket')
+            .setStyle(ButtonStyle.Primary);
 
-      if (currentQuestionIndex < applicationQuestions.length) {
-        const nextQuestionDetail = applicationQuestions[currentQuestionIndex];
-        const questionToSend = nextQuestionDetail.question;
-        let questionAlreadySentByLlm = false;
-
-        // Check if the LLM's suggested_bot_response (already sent at the top) *was* this question.
-        if (currentLlmResponse?.suggested_bot_response?.toLowerCase().includes(questionToSend.toLowerCase().substring(0,30))) {
-            console.log("[handleClarificationLoop] Current application question seems to have been sent by the LLM's main response. Not re-sending.");
-            questionAlreadySentByLlm = true;
-        } else if (currentQuestionIndex === 0 && currentLlmResponse?.intent === "GUILD_APPLICATION_INTEREST" && currentLlmResponse?.suggested_bot_response) {
-            // Special check for the very first question if the initial intent was application interest.
-            // The bot might have said something like "Great, let's start your application. First question..."
-            if (currentLlmResponse.suggested_bot_response.toLowerCase().includes(applicationQuestions[0].question.toLowerCase().substring(0,30))){
-                console.log("[handleClarificationLoop] First application question was part of initial response.");
-                questionAlreadySentByLlm = true;
-            }
-        }
+        const row = new ActionRowBuilder().addComponents(ticketButton);
         
-        if (!questionAlreadySentByLlm) {
-            console.log(`[handleClarificationLoop] Sending application question Q${currentQuestionIndex}: "${questionToSend}"`);
-            try {
-                const sentQMsg = await channel.send(questionToSend);
-                await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channel.id, questionToSend, sentQMsg.id, null);
-                conversationHistoryForLLM.push({ role: "assistant", content: questionToSend });
-            } catch (e) { console.error("Failed to send app question", e);}
-        }
-        // Update state to reflect that we are waiting for an answer to *this* question.
-        // applicationQuestionIndex in DB should be the index of the question JUST ASKED (or confirmed as asked).
-        await recruitmentCollection.updateOne(
-            { userId: userId, channelId: channel.id },
-            { $set: { 
-                "conversationState.applicationQuestionIndex": currentQuestionIndex, 
-                "conversationState.currentStep": ConversationStep.AWAITING_APPLICATION_ANSWER,
-                "conversationState.activeCollectorType": 'APPLICATION_QNA',
-                "conversationState.stepEntryTimestamp": new Date(),
-                "conversationState.timeoutTimestamp": new Date(Date.now() + GENERAL_CLARIFICATION_TIMEOUT_MS), 
-                applicationData: applicationData 
-            }}
-        );
-        userData = await recruitmentCollection.findOne({ userId: userId, channelId: channel.id }); // Refresh userData
+        const messageContent = currentLlmResponse.suggested_bot_response ? 
+            `${currentLlmResponse.suggested_bot_response}\nIf you'd like to apply, please click the button below to open a recruitment ticket.`:
+            "It sounds like you're interested in applying! Click the button below to open a recruitment ticket.";
 
-        console.log(`[handleClarificationLoop] Setting up APPLICATION_QNA collector for ${userId} for question index ${currentQuestionIndex}.`);
-        const applicationAnswerCollector = channel.createMessageCollector({
-          filter: (m) => m.author.id === userId,
-          time: GENERAL_CLARIFICATION_TIMEOUT_MS, 
-          max: 1,
-        });
-
-        applicationAnswerCollector.on("collect", async (m) => {
-          console.log(`[AppQnACollector] Collected answer: "${m.content}" for Q_idx ${currentQuestionIndex} from ${userId}`);
-          
-          const answeredQuestionKey = applicationQuestions[currentQuestionIndex]?.key;
-          if(answeredQuestionKey) applicationData[answeredQuestionKey] = m.content;
-
-          try {
-                const userMessageEntry = { discordMessageId: m.id, userId: userId, channelId: channel.id, author: "user", content: m.content, timestamp: new Date(m.createdTimestamp) };
-                await messageHistoryCollection.insertOne(userMessageEntry);
-                conversationHistoryForLLM.push({ role: "user", content: m.content });
-                
-                // Update DB with the answer and increment question index for the *next* iteration
-                await recruitmentCollection.updateOne(
-                    { userId: userId, channelId: channel.id }, 
-                    { $set: { 
-                        applicationData: applicationData, 
-                        lastActivityAt: new Date(),
-                        "conversationState.applicationQuestionIndex": currentQuestionIndex + 1 
-                    } }
-                );
-                userData = await recruitmentCollection.findOne({ userId: userId, channelId: channel.id }); // Refresh userData
-            } catch (dbErr) { console.error("DB error logging user app answer or updating state", dbErr); }
-          
-          // For Q&A, we construct a simple ack response or use LLM if user asks a question mid-Q&A
-          // For now, let's assume the user answers the question directly.
-          // The next call to handleClarificationLoop will pick up the new questionIndex and ask the next question.
-          const nextLlmResponse = { 
-              intent: "GUILD_APPLICATION_INTEREST", 
-              requires_clarification: false, 
-              suggested_bot_response: (currentQuestionIndex + 1 < applicationQuestions.length) ? "Thanks!" : null, // Minimal ack, next question will be primary message
-              applicationQuestionIndex: currentQuestionIndex + 1 // Pass the incremented index
-            };
-
-          await handleClarificationLoop(member, channel, nextLlmResponse, conversationHistoryForLLM, recruitmentCollection, messageHistoryCollection, guild, 0 );
-        });
-
-        applicationAnswerCollector.on("end", async (collected, reason) => {
-          if (reason === "time" && collected.size === 0) {
-            console.log(`[AppQnACollector] Timed out for ${userId} on Q_idx ${currentQuestionIndex}.`);
-             try {
-                const timeoutMsgContent = "It looks like you've gone quiet during the application. If you want to continue, just send a message with your answer. This channel will remain open for a while.";
-                const sentTimeoutMsg = await channel.send(timeoutMsgContent);
-                await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channel.id, timeoutMsgContent, sentTimeoutMsg.id, null);
-                // Keep state as awaiting answer for this question index
-                await recruitmentCollection.updateOne({ userId: userId }, { $set: { "conversationState.timeoutTimestamp": null } }); 
-            } catch (sendError) { console.error("Failed to send application QnA timeout message", sendError); }
-          }
-        });
-
-      } else {
-        // All questions answered (currentQuestionIndex >= applicationQuestions.length)
-        console.log(`[handleClarificationLoop] All application questions answered by ${userId}.`);
-        const completionMessage = "Thanks for answering all the questions! Your application is complete. A staff member from Wraiven will review it shortly and get back to you here.";
         try {
-            const sentCompletionMsg = await channel.send(completionMessage);
-            await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channel.id, completionMessage, sentCompletionMsg.id, null);
-            conversationHistoryForLLM.push({ role: "assistant", content: completionMessage });
-        } catch (e) { console.error("Failed to send app completion message", e); }
+            // The initial LLM response (if any) was already sent at the top of the function.
+            // If that response already mentioned applying, this message with the button supplements it.
+            // If there was no suggested_bot_response, this will be the primary message.
+            
+            // We need to decide if we *resend* the LLM's suggested_bot_response here OR rely on it being sent at the top.
+            // For simplicity and to avoid double messages, let's assume suggested_bot_response was ALREADY sent if it existed.
+            // So, the message here is primarily to present the button.
 
-        await recruitmentCollection.updateOne(
-            { userId: userId, channelId: channel.id },
-            { $set: { 
-                applicationStatus: "SUBMITTED", 
-                applicationData: applicationData, 
-                submittedAt: new Date(),
-                "conversationState.currentStep": ConversationStep.IDLE, 
-                "conversationState.activeCollectorType": null,
-                "conversationState.applicationQuestionIndex": null, 
-                "conversationState.lastLlmIntent": "APPLICATION_COMPLETE",
-                "conversationState.timeoutTimestamp": null
-            }}
-        );
-        await notifyStaff(guild, `User ${member.user.tag} (Channel: ${channel.name}) has completed their application for ${GUILD_NAME}. Please review. Application Data: ${JSON.stringify(applicationData, null, 2)}`, "APPLICATION_SUBMITTED");
+            const buttonMessageText = "To proceed with your application for Wraiven, please click the button below to open a dedicated recruitment ticket.";
+            
+            // If currentLlmResponse.suggested_bot_response was already sent, just send the button text.
+            // Otherwise, combine them if the LLM's response was generic.
+            // Given the code at the top, currentLlmResponse.suggested_bot_response was ALREADY sent.
+            // So we just send the button prompt now.
+
+            const sentButtonMessage = await channel.send({ 
+                content: buttonMessageText,
+                components: [row] 
+            });
+            await logBotMsgToHistory(messageHistoryCollection, recruitmentCollection, userId, channel.id, buttonMessageText, sentButtonMessage.id, null);
+            conversationHistoryForLLM.push({ role: "assistant", content: buttonMessageText, components: "BUTTON_OPEN_TICKET" }); // Log button presence
+
+            console.log(`[handleClarificationLoop] Sent 'Open Recruitment Ticket' button to ${userId} in channel ${channel.name}.`);
+
+            // Update conversation state to general listening in this channel, as ticket opens a new one.
+            await recruitmentCollection.updateOne(
+                { userId: userId, channelId: channel.id },
+                { $set: { 
+                    "conversationState.currentStep": ConversationStep.GENERAL_LISTENING,
+                    "conversationState.activeCollectorType": 'GENERAL',
+                    "conversationState.timeoutTimestamp": new Date(Date.now() + GENERAL_CLARIFICATION_TIMEOUT_MS * 3),
+                    "conversationState.lastLlmIntent": "APPLICATION_TICKET_OFFERED",
+                    "conversationState.applicationQuestionIndex": null // Clear Q&A index
+                }}
+            );
+            userData = await recruitmentCollection.findOne({ userId: userId, channelId: channel.id }); // Refresh userData
+
+            // Set up a general listener in the current processing channel
+            // This is crucial because the user might say something else here instead of clicking the button.
+            conversationShouldContinue = true; // Ensure the default general listener might be set up
+            nextStep = ConversationStep.GENERAL_LISTENING; // Confirm this state for the default block later
+            nextCollectorType = 'GENERAL';
+
+
+        } catch (error) {
+            console.error(`[handleClarificationLoop] Error sending 'Open Recruitment Ticket' button for ${userId}:`, error);
+            await notifyStaff(guild, `Error sending ticket button to ${member.user.tag}. Error: ${error.message}`, "TICKET_BUTTON_SEND_ERROR");
+            // Fallback to general listening if button send fails
+             await recruitmentCollection.updateOne(
+                { userId: userId, channelId: channel.id },
+                { $set: { 
+                    "conversationState.currentStep": ConversationStep.GENERAL_LISTENING,
+                    "conversationState.activeCollectorType": 'GENERAL',
+                    "conversationState.timeoutTimestamp": new Date(Date.now() + GENERAL_CLARIFICATION_TIMEOUT_MS * 3)
+                }}
+            );
+        }
+      } else if (requiresClarification) {
+          // If GUILD_APPLICATION_INTEREST but requiresClarification is true,
+          // the standard clarification collector at the top (or in UNCLEAR_INTENT) will handle it.
+          console.log(`[handleClarificationLoop] GUILD_APPLICATION_INTEREST with requiresClarification=true. Will be handled by clarification logic.`);
+          // No specific action here, relies on the requiresClarification block and UNCLEAR_INTENT case collector.
       }
       break;
 
