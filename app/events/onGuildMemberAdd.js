@@ -316,10 +316,10 @@ async function processNewUser(member, database) {
 
   // Post a welcome message in their channel
   await channel.send(
-    `Hello, **${member.user.username}**, welcome to House Valier!`
+    `Hello, **${member.user.username}**, welcome to Wraiven!`
   );
   await channel.send(
-    "What is your purpose for joining the House Valier Discord channel?"
+    "What is your purpose for joining the Wraiven Discord channel?"
   );
 
   // Collect the user's first message in response

@@ -48,12 +48,17 @@ RULES FOR 'COMMUNITY_INTEREST_VOUCH' INTENT:
 1. If the user explicitly @mentions a Discord user OR provides a clear, specific username as a voucher (e.g., "My friend JohnDoe can vouch"), set 'intent' to 'COMMUNITY_INTEREST_VOUCH', extract the @mention or username into 'vouch_person_name', set 'requires_clarification' to false, and populate 'suggested_bot_response' to acknowledge this specific person.
 2. If the user mentions a generic group like "my friends", "a buddy", "someone I know" WITHOUT a specific username or @mention, you MUST set 'intent' to 'COMMUNITY_INTEREST_VOUCH', set 'vouch_person_name' to null, set 'requires_clarification' to true. In this case, 'suggested_bot_response' MUST be a question asking the user to provide the specific @mention or username of their friend in the guild.
 
-Possible Intents (follow above rules for COMMUNITY_INTEREST_VOUCH):
+RULES FOR VAGUE INITIAL RESPONSES (like "Content", "Info", "Playing"):
+1. If the "Latest User Message" is a very short, vague, or non-specific answer to the bot's initial question "What is your purpose for joining...", and it doesn't clearly fit GUILD_APPLICATION_INTEREST or have a specific vouch, then you MUST set 'intent' to 'UNCLEAR_INTENT'.
+2. For this 'UNCLEAR_INTENT' due to vagueness, 'requires_clarification' MUST be true.
+3. The 'suggested_bot_response' for this type of UNCLEAR_INTENT should ask clarifying questions to guide the user. For example: "Okay! To help me understand better, what specifically are you looking for? For example, are you interested in specific game content, looking to apply to the guild, or perhaps join our community and play with existing members?"
+
+Possible Intents (follow above rules):
 - GUILD_APPLICATION_INTEREST: User expresses clear interest in applying to the guild for raiding/M+/etc.
 - COMMUNITY_INTEREST_VOUCH: (See RULES FOR 'COMMUNITY_INTEREST_VOUCH' INTENT above).
-- GENERAL_QUESTION: User is asking a general question about the guild (e.g., raid times, rules, what game you play).
+- GENERAL_QUESTION: User is asking a general question about the guild (e.g., raid times, rules, what game you play), not a vague initial purpose statement.
 - SOCIAL_GREETING: User is just saying hello or making a simple social gesture.
-- UNCLEAR_INTENT: User's message is too vague or unclear to determine a specific intent, or doesn't fit other categories after applying vouch rules.
+- UNCLEAR_INTENT: User's message is too vague or unclear to determine a specific intent (especially after the initial purpose question, see VAGUE INITIAL RESPONSES rules), or doesn't fit other categories after applying vouch rules.
 - OTHER: None of the above.
 
 Conversation History (if any):
@@ -203,10 +208,10 @@ export async function processUserMessageWithLLM(
 // Example of how you might structure a more complex prompt for a real LLM
 /*
 function buildPromptForLLM(userMessage, userId, guildInfo, conversationHistory) {
-  const systemPrompt = `You are a helpful and friendly recruitment assistant for the MMORPG guild "House Valier".
+  const systemPrompt = `You are a helpful and friendly recruitment assistant for the MMORPG guild "Wraiven".
 Your goal is to understand new user's intentions, answer their questions, and guide them through the application process if they are interested.
 Guild Information:
-- Guild Name: House Valier
+- Guild Name: Wraiven
 - Focus: Semi-hardcore Raiding & Community
 - Primary Game: [Specify Game Name]
 - Recruitment Status: Currently recruiting [Tank, Healer, DPS - specify needs]
