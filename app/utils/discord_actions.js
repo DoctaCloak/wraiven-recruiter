@@ -59,6 +59,7 @@ export async function initiateVouchProcess(
 
     // 3. Set up reaction collector
     const filter = (reaction, user) => {
+      console.log(`[VouchProcess DEBUG] Reaction received: Emoji Name: "${reaction.emoji.name}", Emoji ID: ${reaction.emoji.id}, User ID: ${user.id}, Expected Voucher ID: ${voucherMember.id}`);
       return ['👍', '👎'].includes(reaction.emoji.name) && user.id === voucherMember.id;
     };
 
