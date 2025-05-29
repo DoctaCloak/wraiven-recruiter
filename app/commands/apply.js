@@ -5,10 +5,6 @@ export default {
         .setName('apply')
         .setDescription('Apply for an open guild role or express interest.')
         .addStringOption(option =>
-            option.setName('opening_id')
-                .setDescription('The ID of the specific opening you are applying for (if known).')
-                .setRequired(false)) // Making it optional if they want to generally apply
-        .addStringOption(option =>
             option.setName('character_name')
                 .setDescription('Your main character\'s in-game name.')
                 .setRequired(true))
@@ -31,7 +27,11 @@ export default {
         .addStringOption(option =>
             option.setName('short_message')
                 .setDescription('Why you want to join or are interested in this role/guild.')
-                .setRequired(false)),
+                .setRequired(false))
+        .addStringOption(option =>
+            option.setName('opening_id')
+                .setDescription('The ID of the specific opening you are applying for (if known).')
+                .setRequired(false)), // Making it optional if they want to generally apply
     async execute(interaction) {
         const options = interaction.options;
         const openingId = options.getString('opening_id');
