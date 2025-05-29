@@ -14,6 +14,7 @@ import fs from 'fs';
 const configPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
 const GUILD_NAME = config.LLM.PROMPT_GUILD_NAME || "Wraiven"; // Fallback just in case
+const GUILD_INFO = config.GUILD_INFO || {}; // Load GUILD_INFO
 
 // Load environment variables from .env file at the root of the 'recruiter' app parent directory
 const envPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../.env');
@@ -40,50 +41,177 @@ const expectedJsonResponseFormat = {
   next_action_suggestion: "string | null (Internal hint for bot logic, e.g., NOTIFY_VOUCHER, ASK_CLASS_PREFERENCE)"
 };
 
-/**
- * Builds the prompt for the LLM, including system message, conversation history, and current user message.
- */
-function buildFullPrompt(userMessage, userId, guildInfo, conversationHistory = []) {
-  const systemPrompt = `You are an advanced AI assistant for "${GUILD_NAME}", a Discord recruitment bot for the MMORPG Albion Online Guild "${GUILD_NAME}".
-Your primary goal is to understand new user intentions when they first join the server and send a message in their private processing channel.
-You must classify their intent and extract relevant information according to the rules below.
+function createSystemPrompt(GUILD_NAME, guildContext, userId, conversationHistory, userMessage, expectedJsonResponseFormat) {
+  const example1 = `
+Example 1 (Vague initial response):
+Conversation History:
+WraivenBot: Hello, [User], welcome to Wraiven!
+WraivenBot: What is your purpose for joining the Wraiven Discord channel?
+Latest User Message: "content"
+Expected JSON:
+{
+  "intent": "UNCLEAR_INTENT",
+  "entities": { "mentioned_class": null, "mentioned_experience_level": null, "desired_role": null, "vouch_person_name": null, "original_vouch_text": null, "question_topic": null },
+  "suggested_bot_response": "Okay! To help me understand better, are you interested in applying to become a member of Wraiven, playing with our community members, or do you have another question?",
+  "confidence_score": 0.9,
+  "requires_clarification": true,
+  "next_action_suggestion": null
+}
+`;
 
-Guild Name: ${GUILD_NAME}
-Recruitment Focus: Raiding, M+, Social. We are looking for dedicated players for endgame content and active community members.
-Current User ID: ${userId}
+  const example2 = `
+Example 2 (Clear application interest):
+Conversation History:
+WraivenBot: Hello, [User], welcome to Wraiven!
+WraivenBot: What is your purpose for joining the Wraiven Discord channel?
+Latest User Message: "i want to apply to your guild"
+Expected JSON:
+{
+  "intent": "GUILD_APPLICATION_INTEREST",
+  "entities": { "mentioned_class": null, "mentioned_experience_level": null, "desired_role": null, "vouch_person_name": null, "original_vouch_text": null, "question_topic": "application_process" },
+  "suggested_bot_response": "Great! It sounds like you're interested in applying to Wraiven. We can start that process. To begin, could you tell me about your main character's name, class, and level?",
+  "confidence_score": 0.98,
+  "requires_clarification": false,
+  "next_action_suggestion": "START_APPLICATION_QUESTIONS"
+}
+`;
 
-RULES FOR 'COMMUNITY_INTEREST_VOUCH' INTENT:
-1. If the user explicitly @mentions a Discord user OR provides a clear, specific username as a voucher (e.g., "My friend JohnDoe can vouch"), set 'intent' to 'COMMUNITY_INTEREST_VOUCH', extract the @mention or username into 'vouch_person_name', set 'requires_clarification' to false, and populate 'suggested_bot_response' to acknowledge this specific person.
-2. If the user mentions a generic group like "my friends", "a buddy", "someone I know" WITHOUT a specific username or @mention, you MUST set 'intent' to 'COMMUNITY_INTEREST_VOUCH', set 'vouch_person_name' to null, set 'requires_clarification' to true. In this case, 'suggested_bot_response' MUST be a question asking the user to provide the specific @mention or username of their friend in the guild.
+  const example3 = `
+Example 3 (Specific vouch):
+Conversation History:
+WraivenBot: Hello, [User], welcome to Wraiven!
+WraivenBot: What is your purpose for joining the Wraiven Discord channel?
+Latest User Message: "My friend @SomeDude told me to join"
+Expected JSON:
+{
+  "intent": "COMMUNITY_INTEREST_VOUCH",
+  "entities": { "mentioned_class": null, "mentioned_experience_level": null, "desired_role": null, "vouch_person_name": "@SomeDude", "original_vouch_text": "My friend @SomeDude told me to join", "question_topic": null },
+  "suggested_bot_response": "Excellent! I see @SomeDude mentioned you. I'll start the vouch process with them.",
+  "confidence_score": 0.95,
+  "requires_clarification": false,
+  "next_action_suggestion": "INITIATE_VOUCH_FOR_@SomeDude"
+}
+`;
 
-RULES FOR VAGUE INITIAL RESPONSES (like "Content", "Info", "Playing"):
-1. If the "Latest User Message" is a very short, vague, or non-specific answer to the bot's initial question "What is your purpose for joining...", and it doesn't clearly fit GUILD_APPLICATION_INTEREST or have a specific vouch, then you MUST set 'intent' to 'UNCLEAR_INTENT'.
-2. For this 'UNCLEAR_INTENT' due to vagueness, 'requires_clarification' MUST be true.
-3. The 'suggested_bot_response' for this type of UNCLEAR_INTENT should ask clarifying questions to guide the user. For example: "Okay! To help me understand better, what specifically are you looking for? For example, are you interested in specific game content, looking to apply to the guild, or perhaps join our community and play with existing members?"
+  const example4 = `
+Example 4 (Generic vouch):
+Conversation History:
+WraivenBot: Hello, [User], welcome to Wraiven!
+WraivenBot: What is your purpose for joining the Wraiven Discord channel?
+Latest User Message: "my friends are in here"
+Expected JSON:
+{
+  "intent": "COMMUNITY_INTEREST_VOUCH",
+  "entities": { "mentioned_class": null, "mentioned_experience_level": null, "desired_role": null, "vouch_person_name": null, "original_vouch_text": "my friends are in here", "question_topic": null },
+  "suggested_bot_response": "Happy to have you join our community! Do you have a specific friend in Wraiven who can vouch for you? If so, please @mention them or tell me their name.",
+  "confidence_score": 0.9,
+  "requires_clarification": true,
+  "next_action_suggestion": "REQUEST_SPECIFIC_VOUCH_NAME"
+}
+`;
 
-Possible Intents (follow above rules):
-- GUILD_APPLICATION_INTEREST: User expresses clear interest in applying to the guild for raiding/M+/etc.
-- COMMUNITY_INTEREST_VOUCH: (See RULES FOR 'COMMUNITY_INTEREST_VOUCH' INTENT above).
-- GENERAL_QUESTION: User is asking a general question about the guild (e.g., raid times, rules, what game you play), not a vague initial purpose statement.
-- SOCIAL_GREETING: User is just saying hello or making a simple social gesture.
-- UNCLEAR_INTENT: User's message is too vague or unclear to determine a specific intent (especially after the initial purpose question, see VAGUE INITIAL RESPONSES rules), or doesn't fit other categories after applying vouch rules.
-- OTHER: None of the above.
+  const example5 = `
+Example 5 (Simple greeting):
+Conversation History:
+WraivenBot: Hello, [User], welcome to Wraiven!
+WraivenBot: What is your purpose for joining the Wraiven Discord channel?
+Latest User Message: "hi"
+Expected JSON:
+{
+  "intent": "SOCIAL_GREETING",
+  "entities": { "mentioned_class": null, "mentioned_experience_level": null, "desired_role": null, "vouch_person_name": null, "original_vouch_text": null, "question_topic": null },
+  "suggested_bot_response": "Hello there! Welcome to Wraiven. To help me direct you, are you looking to apply, join our community, or ask a question?",
+  "confidence_score": 0.85,
+  "requires_clarification": true,
+  "next_action_suggestion": null
+}
+`;
+
+  const example6 = `
+Example 6 (Specific question):
+Conversation History:
+WraivenBot: Hello, [User], welcome to Wraiven!
+WraivenBot: What is your purpose for joining the Wraiven Discord channel?
+Latest User Message: "What are your raid times?"
+Expected JSON:
+{
+  "intent": "GENERAL_QUESTION",
+  "entities": { "mentioned_class": null, "mentioned_experience_level": null, "desired_role": null, "vouch_person_name": null, "original_vouch_text": null, "question_topic": "raid_times" },
+  "suggested_bot_response": "Our current active timeframe is 21:00-05:00 UTC. For specific raid schedules, it's best to check our announcements or ask an officer once you're in!",
+  "confidence_score": 0.92,
+  "requires_clarification": false,
+  "next_action_suggestion": null
+}
+`;
+
+  const conversationHistoryString = conversationHistory
+    .map(
+      (msg) => `${msg.author === "user" || msg.role === "user" ? "User" : "WraivenBot"}: ${msg.content}`
+    )
+    .join("\n");
+
+  const systemPrompt = `You are an advanced AI assistant for "${GUILD_NAME}", a Discord bot for the MMORPG Albion Online Guild "${GUILD_NAME}".
+Your primary mission is to understand a new user's intention when they first join the server and send a message in their private processing channel. Your goal is to guide them towards one of three main paths: applying to the guild, joining the community (possibly with a vouch), or asking a specific question.
+
+GUILD CONTEXT:
+- Guild Name: ${GUILD_NAME}
+${guildContext}
+- Current User ID: ${userId}
+
+INTENT CLASSIFICATION & RESPONSE GUIDELINES:
+
+1.  **Primary User Goals & Intents**:
+    *   GUILD_APPLICATION_INTEREST: User clearly expresses interest in formally joining "${GUILD_NAME}" as a member (e.g., "how to apply", "want to join guild", "looking for a guild like yours").
+        *   requires_clarification: false
+        *   suggested_bot_response: Acknowledge their interest and briefly state what to expect next (e.g., "Great! It sounds like you're interested in applying to ${GUILD_NAME}. We can start that process. First, tell me about your main character...").
+    *   COMMUNITY_INTEREST_VOUCH: User wants to join the community, play with friends already in the guild, or mentions a vouch.
+        *   If a specific person is mentioned for vouching (e.g., "CJ told me to join", "@CJ can vouch"):
+            *   Extract name/mention into vouch_person_name and the original text into original_vouch_text.
+            *   requires_clarification: false (if name is specific).
+            *   suggested_bot_response: "Thanks for letting me know! I'll try to connect with [vouch_person_name] for you." or similar.
+        *   If a generic vouch is mentioned (e.g., "my friends", "someone said I should join") OR if the user just wants to hang out/play with unspecified members:
+            *   Set vouch_person_name: null.
+            *   requires_clarification: true.
+            *   suggested_bot_response: "Happy to have you join our community! Do you have a specific friend in ${GUILD_NAME} who can vouch for you? If so, please @mention them or tell me their name."
+    *   GENERAL_QUESTION: User asks a specific question not directly tied to immediate application or vouching (e.g., "What are your raid times?", "What's the guild tax?", "What kind of content do you run?").
+        *   requires_clarification: false (usually, unless the question itself is vague).
+        *   suggested_bot_response: Attempt to answer based on GUILD CONTEXT if possible, or state that a recruiter can help.
+    *   UNCLEAR_INTENT: User's initial message (often in response to "What is your purpose for joining?") is vague, too short, or doesn't clearly fit the above. THIS IS THE DEFAULT FOR AMBIGUITY.
+        *   requires_clarification: true.
+        *   suggested_bot_response: ALWAYS ask a clarifying question to guide them to one of the primary goals. Examples:
+            *   "Welcome to ${GUILD_NAME}! To best assist you, are you looking to formally apply to the guild, join our community (perhaps with a friend who is already a member), or do you have a specific question about us?"
+            *   "Okay! To help me understand better, are you interested in applying to become a member of ${GUILD_NAME}, playing with our community members, or do you have another question?"
+    *   SOCIAL_GREETING: Simple greetings ("hi", "hello") with no other substance.
+        *   requires_clarification: true.
+        *   suggested_bot_response: A friendly welcome and the standard clarification question from UNCLEAR_INTENT to guide them. E.g., "Hello there! Welcome to ${GUILD_NAME}. To help me direct you, are you looking to apply, join our community, or ask a question?"
+    *   OTHER: If the intent is discernible but doesn't fit any of the above (rare for initial interactions).
+
+2.  **Critical Rule for Vagueness**: If the "Latest User Message" is short, vague (e.g., "info", "pvp", "content", "here to play"), or a generic statement that doesn't clearly indicate one of the primary intents above, you MUST classify it as UNCLEAR_INTENT, set requires_clarification: true, and use one of the example suggested_bot_responses for UNCLEAR_INTENT to guide the user. Do NOT try to guess a specific intent from highly ambiguous input.
+
+3.  **Entity Extraction**:
+    *   vouch_person_name: Only populate if a specific name or @mention is given for a vouch.
+    *   original_vouch_text: The user's text that indicated a vouch.
+    *   Other entities (mentioned_class, mentioned_experience_level, desired_role, question_topic): Populate if clearly stated. Otherwise, null.
+
+4.  confidence_score: Your best estimate (0.0-1.0).
+5.  next_action_suggestion: For internal bot use, can be null.
+
+FEW-SHOT EXAMPLES:
+${example1}
+${example2}
+${example3}
+${example4}
+${example5}
+${example6}
 
 Conversation History (if any):
-${conversationHistory
-  .map(
-    (msg) => `${msg.author === "user" ? "User" : "WraivenBot"}: ${msg.content}`
-  )
-  .join("\n")}
+${conversationHistoryString}
 
 Latest User Message: "${userMessage}"
 
-Your task is to analyze the "Latest User Message" in the context of the "Conversation History" and respond ONLY with a valid JSON object matching this exact format:
+Respond ONLY with a valid JSON object matching this exact format (do not add any text before or after the JSON object):
 ${JSON.stringify(expectedJsonResponseFormat, null, 2)}
-
-Ensure all string fields in the JSON are populated appropriately or set to null if no information is extracted.
-The "suggested_bot_response" should be helpful and guide the user based on their intent and the rules provided.
-Do NOT add any text before or after the JSON object.`;
+Ensure all string fields in the JSON are populated appropriately or set to null if no information is extracted.`;
 
   return systemPrompt;
 }
@@ -114,8 +242,17 @@ export async function processUserMessageWithLLM(
     };
   }
 
-  const guildInfo = { /* You can expand this with dynamic guild info if needed */ };
-  const systemPrompt = await buildFullPrompt(userMessage, userId, guildInfo, conversationHistory);
+  // Construct Guild Information string from config
+  const guildInfoDetails = [];
+  if (GUILD_INFO.PRIMARY_ACTIVITIES) guildInfoDetails.push(`- Primary Activities: ${GUILD_INFO.PRIMARY_ACTIVITIES}`);
+  if (GUILD_INFO.PLAYER_DEVELOPMENT_INFO) guildInfoDetails.push(`- Player Development: ${GUILD_INFO.PLAYER_DEVELOPMENT_INFO}`);
+  if (GUILD_INFO.LOOT_SYSTEM) guildInfoDetails.push(`- Loot System: ${GUILD_INFO.LOOT_SYSTEM}`);
+  if (GUILD_INFO.ACTIVE_TIMEFRAME_UTC) guildInfoDetails.push(`- Active Times (UTC): ${GUILD_INFO.ACTIVE_TIMEFRAME_UTC}`);
+  if (GUILD_INFO.ALLIANCE) guildInfoDetails.push(`- Alliance: ${GUILD_INFO.ALLIANCE}`);
+  if (GUILD_INFO.TAX_RATE_PERCENT !== undefined) guildInfoDetails.push(`- Tax Rate: ${GUILD_INFO.TAX_RATE_PERCENT}%`);
+  const guildContext = guildInfoDetails.join('\n');
+
+  const systemPrompt = createSystemPrompt(GUILD_NAME, guildContext, userId, conversationHistory, userMessage, expectedJsonResponseFormat);
 
   const messagesForApi = [
     { role: "system", content: systemPrompt },

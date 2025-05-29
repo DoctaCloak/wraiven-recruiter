@@ -29,6 +29,7 @@ const INITIAL_USER_RESPONSE_TIMEOUT_MS = config.TIMERS.INITIAL_USER_RESPONSE_MIN
 const VOUCH_MENTION_CLARIFICATION_TIMEOUT_MS = config.TIMERS.VOUCH_MENTION_CLARIFICATION_MINUTES * 60 * 1000;
 const GENERAL_CLARIFICATION_TIMEOUT_MS = config.TIMERS.GENERAL_CLARIFICATION_MINUTES * 60 * 1000;
 
+const MAX_CLARIFICATION_ATTEMPTS = 3;
 
 const ACCESS_STATUS = {
   PENDING: "PENDING",
@@ -555,147 +556,84 @@ async function processNewUser(member, database) {
           console.log(`[RecruiterApp] Intent: GENERAL_QUESTION, Entities:`, llmResponse.entities);
           botResponseMessageContent = llmResponse.suggested_bot_response || "That's a good question!";
           await channel.send(botResponseMessageContent);
+          await logBotMsgToHistory(botResponseMessageContent, llmResponse);
           break;
 
         default: 
           console.log(`[RecruiterApp] Intent: ${llmResponse.intent} (processing in default/clarification path)`);
           botResponseMessageContent = llmResponse.suggested_bot_response;
-          let needsFollowUpCollector = false;
-
+          
           if (!botResponseMessageContent) {
             console.warn(
               "[RecruiterApp] No suggested_bot_response from LLM or LLM failed for default case."
             );
             botResponseMessageContent =
               "I'm having a little trouble understanding that. A guild officer will be with you shortly to help.";
+            await channel.send(botResponseMessageContent);
+            await logBotMsgToHistory(botResponseMessageContent, llmResponse);
           } else if (llmResponse.requires_clarification) {
-            needsFollowUpCollector = true;
-            console.log("[RecruiterApp] LLM requires clarification, will set up follow-up collector.");
-          }
-          
-          await channel.send(botResponseMessageContent); 
-
-          if (needsFollowUpCollector) {
+            console.log("[RecruiterApp] LLM requires clarification, initiating clarification loop.");
+            // Send the first clarification question from the initial LLM response
+            await channel.send(botResponseMessageContent);
+            // Log this first bot query before starting the loop
             await logBotMsgToHistory(botResponseMessageContent, llmResponse); 
-            botResponseMessageContent = null; 
 
-            const clarificationFilter = m => m.author.id === member.id && m.channel.id === channel.id;
-            const clarificationCollector = channel.createMessageCollector({ filter: clarificationFilter, max: 1, time: GENERAL_CLARIFICATION_TIMEOUT_MS }); // Used config timer
+            // History for the loop should include the bot's first clarification question
+            const historyForLoop = [...conversationHistoryForLLM, { role: "assistant", content: botResponseMessageContent }];
 
-            clarificationCollector.on('collect', async (clarificationMessage) => {
-              console.log(`[RecruiterApp] Collected clarification response: "${clarificationMessage.content}"`);
-              await messageHistoryCollection.insertOne({
-                  userId: member.id, channelId: channel.id, author: "user", 
-                  content: clarificationMessage.content, timestamp: new Date(clarificationMessage.createdTimestamp)
-              });
-              await recruitmentCollection.updateOne({ userId: member.id }, { $set: { lastActivityAt: new Date() } });
+            // Call the new clarification loop. It will handle collecting the user's next message.
+            // Pass the user's *original* message.content as the first "userMessageContent" for the loop to process again 
+            // if the LLM needs to re-evaluate it based on its own clarification question.
+            // However, since we are *about* to collect a *new* message from the user in the loop,
+            // we can pass an empty string or a marker for the first userMessageContent to handleClarificationLoop,
+            // as it will immediately set up a collector for the user's actual response to botResponseMessageContent.
+            // Let's make the loop directly collect the response to the botResponseMessageContent.
+            
+            // The handleClarificationLoop will set up its own collector for the user's response
+            // to the botResponseMessageContent that was just sent.
+            // We pass the history *including* the bot query that was just sent.
+            // The userMessageContent for the first call to the loop will be the user's *next* message.
+            
+            // Simpler: The bot has asked its question (botResponseMessageContent).
+            // The loop will create a collector for the user's answer to *that* question.
+            // So, the userMessageContent to kick off the loop for the *first iteration* is effectively what the *new* collector will get.
+            // The history passed to the loop should be up to and including the bot's question.
+            
+            const initialClarificationFilter = m => m.author.id === member.id && m.channel.id === channel.id;
+            const initialClarificationCollectorForLoop = channel.createMessageCollector({ filter: initialClarificationFilter, max: 1, time: GENERAL_CLARIFICATION_TIMEOUT_MS });
 
-              let updatedHistoryForLLM = [];
-              try {
-                const userHistory = await messageHistoryCollection.find(
-                    { userId: member.user.id, channelId: channel.id }
-                    ).sort({ timestamp: 1 }).toArray();
-                updatedHistoryForLLM = userHistory.map(histMsg => ({ role: histMsg.author === "user" ? "user" : "assistant", content: histMsg.content }));
-              } catch (dbError) { console.error("[RecruiterApp] Error fetching updated history for re-processing:", dbError); }
-
-              const followUpLlmResponse = await processUserMessageWithLLM(
-                clarificationMessage.content,
-                member.user.id,
-                updatedHistoryForLLM,
-                channel.id 
-              );
-              console.log("[RecruiterApp] LLM Response from clarification:", JSON.stringify(followUpLlmResponse, null, 2));
-              
-              let finalBotResponseFromClarification; 
-
-              switch (followUpLlmResponse?.intent) {
-                case "GUILD_APPLICATION_INTEREST":
-                  console.log(`[Clarification->Switch] User (${member.user.tag}) expressed GUILD_APPLICATION_INTEREST.`);
-                  finalBotResponseFromClarification = `Great! It sounds like you're interested in formally applying to join ${GUILD_NAME}. Let's start the process.`; // Used GUILD_NAME
-                  await channel.send(finalBotResponseFromClarification);
-                  await logBotMsgToHistory(finalBotResponseFromClarification, followUpLlmResponse);
-
-                  await recruitmentCollection.updateOne(
-                    { userId: member.id },
-                    { 
-                      $set: { 
-                        communityStatus: "APPLICATION_STARTED", 
-                        applicationIntent: followUpLlmResponse.intent,
-                        applicationDetails: followUpLlmResponse.entities,
-                        updatedAt: new Date()
-                      },
-                      $push: { 
-                        logs: { 
-                          timestamp: new Date(), 
-                          event: "Application process started after clarification.",
-                          llmResponse: followUpLlmResponse
-                        } 
-                      }
-                    }
-                  );
-                  await notifyStaff(
-                    guild, 
-                    `User ${member.user.tag} (${member.id}) has expressed interest in applying to the guild in channel #${channel.name}.`,
-                    "GUILD_APPLICATION_STARTED"
-                  );
-
-                  const firstQuestion = "To begin, could you please tell us about your primary in-game character name, class, and level?";
-                  await channel.send(firstQuestion);
-                  await logBotMsgToHistory(firstQuestion, {type: "APPLICATION_QUESTION_1"});
-                  
-                  const nextStepsMsg = "Once you've answered, a recruiter will review your initial interest. You can also use `/apply` to submit a full application if available.";
-                  await channel.send(nextStepsMsg);
-                  await logBotMsgToHistory(nextStepsMsg);
-                  break;
-
-                case "COMMUNITY_INTEREST_VOUCH":
-                  console.log("[RecruiterApp] Clarified intent: COMMUNITY_INTEREST_VOUCH. Attempting to start vouch process.");
-                  const clarifiedVouchPersonName = followUpLlmResponse.entities?.vouch_person_name;
-                  let clarifiedVoucherMember;
-
-                  if (clarifiedVouchPersonName) {
-                    clarifiedVoucherMember = guild.members.cache.find(m =>
-                      m.id === clarifiedVouchPersonName.replace(/<@!?(\d+)>/g, '$1') ||
-                      m.user.username.toLowerCase() === clarifiedVouchPersonName.toLowerCase() ||
-                      m.displayName.toLowerCase() === clarifiedVouchPersonName.toLowerCase()
-                    );
-                  }
-
-                  if (clarifiedVoucherMember) {
-                    finalBotResponseFromClarification = followUpLlmResponse.suggested_bot_response || `Thanks for clarifying! I found ${clarifiedVoucherMember.user.tag}. Starting the vouch process now.`;
-                    await channel.send(finalBotResponseFromClarification);
-                    await logBotMsgToHistory(finalBotResponseFromClarification, followUpLlmResponse);
-                    
-                    await initiateVouchProcess(member, clarifiedVoucherMember, channel, followUpLlmResponse, recruitmentCollection, messageHistoryCollection);
-                    finalBotResponseFromClarification = null; 
-                  } else {
-                    finalBotResponseFromClarification = followUpLlmResponse.suggested_bot_response || `You mentioned wanting a vouch for ${clarifiedVouchPersonName || 'someone'}, but I still couldn't identify them. Please ensure they are a member of this server. A recruiter can assist you.`;
-                    await channel.send(finalBotResponseFromClarification);
-                    await logBotMsgToHistory(finalBotResponseFromClarification, followUpLlmResponse);
-                    await notifyStaff(guild, `User ${member.user.tag} attempted vouch with '${clarificationMessage.content}' for '${clarifiedVouchPersonName || 'unknown'}' but voucher not found after clarification. Manual assistance needed in channel #${channel.name}.`, "VOUCH_CLARIFY_FAIL_FINAL");
-                  }
-                  break;
-
-                default: 
-                  finalBotResponseFromClarification = followUpLlmResponse?.suggested_bot_response || "Thanks for that information! A recruiter will review this and be with you if further steps are needed.";
-                  await channel.send(finalBotResponseFromClarification);
-                  await logBotMsgToHistory(finalBotResponseFromClarification, followUpLlmResponse);
-                  console.log("[RecruiterApp] Clarified intent was: ", followUpLlmResponse?.intent || "Unknown/Default");
-                  break;
-              }
+            initialClarificationCollectorForLoop.on('collect', async (clarificationMessage) => {
+                // Now we have the user's response to the first clarification question.
+                // conversationHistoryForLLM already contains the user's first message.
+                // historyForLoop contains user's first message + bot's first clarification question.
+                await handleClarificationLoop(
+                    member,
+                    channel,
+                    clarificationMessage.content, // This is the user's answer to the first clarification query
+                    historyForLoop, // Contains history up to the bot's first clarification query
+                    recruitmentCollection,
+                    messageHistoryCollection,
+                    guild,
+                    logBotMsgToHistory,
+                    1 // First attempt *within* the dedicated loop
+                );
             });
 
-            clarificationCollector.on('end', async (collectedMsgs, reason) => {
-              if (reason === 'time' && collectedMsgs.size === 0) {
-                const timeoutClarMsg = "It looks like you didn't provide a clarification. If you still need assistance, please type your query again or ping a recruiter.";
-                await channel.send(timeoutClarMsg).catch(console.error);
-                await logBotMsgToHistory(timeoutClarMsg);
-              }
+            initialClarificationCollectorForLoop.on('end', async (collectedMsgs, reason) => {
+                if (reason === 'time' && collectedMsgs.size === 0) {
+                    const timeoutClarMsg = "It looks like you didn't provide a clarification in time. If you still need assistance, please type your query again or ping a recruiter.";
+                    if(!channel.deleted) await channel.send(timeoutClarMsg).catch(console.error);
+                    await logBotMsgToHistory(timeoutClarMsg);
+                }
             });
+
           } else {
-             await logBotMsgToHistory(botResponseMessageContent, llmResponse);
+            // No clarification needed from the first LLM response, but it was a default/unclear intent.
+            // This path means llmResponse.requires_clarification was false.
+            await channel.send(botResponseMessageContent); 
+            await logBotMsgToHistory(botResponseMessageContent, llmResponse);
           }
-          break;
+          break; // End of default case for the initial collector
       }
     } else {
       console.warn(
@@ -724,6 +662,207 @@ async function processNewUser(member, database) {
       }
     }
   });
+}
+
+async function handleClarificationLoop(
+  member,
+  channel,
+  userMessageContent, // The content of the user's message that needs clarification or is a clarification
+  currentConversationHistory, // Array of {role, content} for LLM
+  recruitmentCollection,
+  messageHistoryCollection,
+  guild, // Pass guild explicitly for actions like notifyStaff and member lookups
+  logBotMsgToHistory, // Pass the helper function
+  attemptCount
+) {
+  console.log(`[ClarificationLoop attempt #${attemptCount}] Processing message: "${userMessageContent}"`);
+
+  // 1. Log the current user's message (if it's not the very first dummy call)
+  if (attemptCount > 0) { // Avoid double logging the first message if handled by initial collector
+    try {
+      await messageHistoryCollection.insertOne({
+        userId: member.user.id,
+        channelId: channel.id,
+        author: "user",
+        content: userMessageContent,
+        timestamp: new Date(), // Consider passing message.createdTimestamp if available
+      });
+      await recruitmentCollection.updateOne(
+        { userId: member.user.id },
+        { $set: { lastActivityAt: new Date() } }
+      );
+    } catch (dbError) {
+      console.error(
+        `[ClarificationLoop] Error saving user message for ${member.user.tag}:`,
+        dbError
+      );
+    }
+  }
+
+  // 2. Update conversation history for this turn (if messageContent is new)
+  // The currentConversationHistory passed in should already include messages up to the one *before* userMessageContent
+  const updatedHistoryForLLM = [
+    ...currentConversationHistory,
+    { role: "user", content: userMessageContent }
+  ];
+
+  // 3. Call LLM
+  const llmResponse = await processUserMessageWithLLM(
+    userMessageContent, // Though context is in history, send current utterance too
+    member.user.id,
+    updatedHistoryForLLM, 
+    channel.id
+  );
+  console.log(`[ClarificationLoop attempt #${attemptCount}] LLM Response:`, JSON.stringify(llmResponse, null, 2));
+
+  // 4. Log LLM's direct response object (useful for debugging)
+  try {
+    await messageHistoryCollection.insertOne({
+        userId: member.user.id,
+        channelId: channel.id,
+        author: "bot_llm_response_obj",
+        content: "LLM Response Object",
+        llm_response_object: llmResponse,
+        timestamp: new Date()
+    });
+  } catch(e){ console.error("[ClarificationLoop] DB Error logging LLM response object:", e); }
+
+  // 5. Logic based on llmResponse
+  if (llmResponse && llmResponse.requires_clarification && attemptCount < MAX_CLARIFICATION_ATTEMPTS) {
+    const botClarificationQuery = llmResponse.suggested_bot_response || "I need a bit more information. Could you please tell me more?";
+    await channel.send(botClarificationQuery);
+    await logBotMsgToHistory(botClarificationQuery, llmResponse);
+
+    const nextAttemptFilter = m => m.author.id === member.id && m.channel.id === channel.id;
+    const nextCollector = channel.createMessageCollector({ filter: nextAttemptFilter, max: 1, time: GENERAL_CLARIFICATION_TIMEOUT_MS });
+
+    nextCollector.on('collect', async (nextMessage) => {
+      // Important: Add the bot's clarification question to history before user's next reply for LLM context
+      const historyWithBotQuery = [...updatedHistoryForLLM, { role: "assistant", content: botClarificationQuery }];
+      await handleClarificationLoop(
+        member,
+        channel,
+        nextMessage.content,
+        historyWithBotQuery, // Pass history including the bot's last question
+        recruitmentCollection,
+        messageHistoryCollection,
+        guild,
+        logBotMsgToHistory,
+        attemptCount + 1
+      );
+    });
+
+    nextCollector.on('end', async (collectedMsgs, reason) => {
+      if (reason === 'time' && collectedMsgs.size === 0) {
+        const timeoutMsg = `[ClarificationLoop attempt #${attemptCount}] It looks like you didn't provide a response. If you still need assistance, please type your query again or ping a recruiter.`;
+        if (!channel.deleted) await channel.send(timeoutMsg).catch(console.error);
+        await logBotMsgToHistory(timeoutMsg);
+      }
+    });
+
+  } else if (llmResponse && llmResponse.requires_clarification && attemptCount >= MAX_CLARIFICATION_ATTEMPTS) {
+    const maxAttemptsMsg = "I've asked for clarification a few times but I'm still not sure how to help. A staff member will be with you shortly.";
+    if (!channel.deleted) await channel.send(maxAttemptsMsg);
+    await logBotMsgToHistory(maxAttemptsMsg, llmResponse);
+    await notifyStaff(guild, `User ${member.user.tag} in channel #${channel.name} reached max clarification attempts. LLM still requires clarification. Manual assistance needed. Last user message: "${userMessageContent}"`, "MAX_CLARIFICATION_ATTEMPTS_REACHED");
+  
+  } else if (llmResponse && llmResponse.intent) {
+    // Intent is considered clear, or no more clarification needed/allowed
+    console.log(`[ClarificationLoop attempt #${attemptCount}] Intent determined: ${llmResponse.intent}. Processing action.`);
+    let finalBotResponse;
+
+    // !!! This switch block is MOVED and ADAPTED from the old clarificationCollector !!!
+    switch (llmResponse.intent) {
+        case "GUILD_APPLICATION_INTEREST":
+            console.log(`[ClarificationLoop->Switch] User (${member.user.tag}) expressed GUILD_APPLICATION_INTEREST.`);
+            finalBotResponse = llmResponse.suggested_bot_response || `Great! It sounds like you're interested in formally applying to join ${GUILD_NAME}. Let's start the process.`;
+            if (!channel.deleted) await channel.send(finalBotResponse);
+            await logBotMsgToHistory(finalBotResponse, llmResponse);
+
+            await recruitmentCollection.updateOne(
+            { userId: member.id },
+            { 
+                $set: { 
+                communityStatus: "APPLICATION_STARTED", 
+                applicationIntent: llmResponse.intent,
+                applicationDetails: llmResponse.entities,
+                updatedAt: new Date()
+                },
+                $push: { 
+                logs: { 
+                    timestamp: new Date(), 
+                    event: "Application process started after clarification loop.",
+                    llmResponse: llmResponse
+                } 
+                }
+            }
+            );
+            await notifyStaff(
+            guild, 
+            `User ${member.user.tag} (${member.id}) has expressed interest in applying to the guild in channel #${channel.name}.`,
+            "GUILD_APPLICATION_STARTED"
+            );
+
+            const firstQuestion = "To begin, could you please tell us about your primary in-game character name, class, and level?";
+            if (!channel.deleted) await channel.send(firstQuestion);
+            await logBotMsgToHistory(firstQuestion, {type: "APPLICATION_QUESTION_1"});
+            
+            const nextStepsMsg = "Once you've answered, a recruiter will review your initial interest. You can also use `/apply` to submit a full application if available.";
+            if (!channel.deleted) await channel.send(nextStepsMsg);
+            await logBotMsgToHistory(nextStepsMsg);
+            break;
+
+        case "COMMUNITY_INTEREST_VOUCH":
+            console.log("[RecruiterApp] Clarified intent: COMMUNITY_INTEREST_VOUCH. Attempting to start vouch process.");
+            const clarifiedVouchPersonName = llmResponse.entities?.vouch_person_name;
+            let clarifiedVoucherMember;
+
+            if (clarifiedVouchPersonName) {
+            clarifiedVoucherMember = guild.members.cache.find(m =>
+                m.id === clarifiedVouchPersonName.replace(/<@!?(\d+)>/g, '$1') ||
+                m.user.username.toLowerCase() === clarifiedVouchPersonName.toLowerCase() ||
+                m.displayName.toLowerCase() === clarifiedVouchPersonName.toLowerCase()
+            );
+            }
+
+            if (clarifiedVoucherMember) {
+            finalBotResponse = llmResponse.suggested_bot_response || `Thanks for clarifying! I found ${clarifiedVoucherMember.user.tag}. Starting the vouch process now.`;
+            if (!channel.deleted) await channel.send(finalBotResponse);
+            await logBotMsgToHistory(finalBotResponse, llmResponse);
+            
+            await initiateVouchProcess(member, clarifiedVoucherMember, channel, llmResponse, recruitmentCollection, messageHistoryCollection);
+            } else {
+            finalBotResponse = llmResponse.suggested_bot_response || `You mentioned wanting a vouch for ${clarifiedVouchPersonName || 'someone'}, but I still couldn't identify them. Please ensure they are a member of this server. A recruiter can assist you.`;
+            if (!channel.deleted) await channel.send(finalBotResponse);
+            await logBotMsgToHistory(finalBotResponse, llmResponse);
+            await notifyStaff(guild, `User ${member.user.tag} attempted vouch with current message for '${clarifiedVouchPersonName || 'unknown'}' but voucher not found after clarification loop. Manual assistance needed in channel #${channel.name}. Last user message: "${userMessageContent}"`, "VOUCH_CLARIFY_FAIL_FINAL_LOOP");
+            }
+            break;
+        
+        // It's good practice to handle UNCLEAR_INTENT explicitly even if requires_clarification became false.
+        case "UNCLEAR_INTENT": 
+            console.log("[ClarificationLoop->Switch] Intent is UNCLEAR_INTENT, but requires_clarification is false. Treating as default.");
+            finalBotResponse = llmResponse.suggested_bot_response || "Thanks for providing more information. A recruiter will review this and be with you if further steps are needed.";
+            if (!channel.deleted) await channel.send(finalBotResponse);
+            await logBotMsgToHistory(finalBotResponse, llmResponse);
+            break;
+
+        default: 
+            finalBotResponse = llmResponse.suggested_bot_response || "Thanks for that information! A recruiter will review this and be with you if further steps are needed.";
+            if (!channel.deleted) await channel.send(finalBotResponse);
+            await logBotMsgToHistory(finalBotResponse, llmResponse);
+            console.log("[ClarificationLoop->Switch] Clarified intent was: ", llmResponse.intent || "Unknown/Default Handling");
+            // Potentially notify staff or log if an unexpected intent is processed here that should have specific handling
+            break;
+    }
+  } else {
+    // Fallback if llmResponse is null or doesn't have .intent (should be rare)
+    console.warn("[ClarificationLoop] LLM response was missing, malformed, or intent could not be processed. Notifying staff.");
+    const errMsg = "I'm having some trouble understanding your request right now. A staff member has been notified and will assist you shortly.";
+    if (!channel.deleted) await channel.send(errMsg);
+    await logBotMsgToHistory(errMsg, llmResponse); // Log even if llmResponse is partial/null
+    await notifyStaff(guild, `User ${member.user.tag} in channel #${channel.name} encountered an issue where the LLM response was problematic after clarification loop. Manual assistance needed. Last user message: "${userMessageContent}"`, "LLM_RESPONSE_ERROR_FINAL_LOOP");
+  }
 }
 
 /********************************************
