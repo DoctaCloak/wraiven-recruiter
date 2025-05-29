@@ -126,15 +126,40 @@ export default function onInteractionCreate(client, database) {
                         console.warn(`[onInteractionCreate] Could not disable button on original message: ${editError.message}`);
                     }
                 }
-                 // 8. Send a message to the original processing channel if it\'s different from the ticket channel
-                 // (This assumes the button was clicked in the processing channel)
-                 if (interaction.channel.id !== ticketChannel.id) {
+                
+                // 8. Send a message to the original processing channel if it's different from the ticket channel
+                // (This assumes the button was clicked in the processing channel)
+                // This step might be redundant if we are about to delete it, but good for user UX just before deletion.
+                if (interaction.channel.id !== ticketChannel.id) { // Should always be true if button is in processing channel
                     try {
-                        await interaction.channel.send(`A recruitment ticket has been opened for you: ${ticketChannel.toString()}`);
+                        // Send one last message before deleting.
+                        await interaction.channel.send(`A recruitment ticket has been opened for you: ${ticketChannel.toString()}. This processing channel will now be closed.`);
                     } catch (e) {
-                        console.warn(`[onInteractionCreate] Could not send confirmation to original processing channel: ${e.message}`);
+                        console.warn(`[onInteractionCreate] Could not send final confirmation to original processing channel: ${e.message}`);
                     }
                  }
+
+                // 9. Delete the original processing channel
+                if (interaction.channel.name.startsWith(config.CHANNEL_PREFIXES?.RECRUITMENT_PROCESSING || "processing-")) {
+                    try {
+                        console.log(`[onInteractionCreate] Deleting original processing channel #${interaction.channel.name} for user ${member.user.tag}.`);
+                        await interaction.channel.delete("Recruitment ticket opened, processing channel no longer needed.");
+                        
+                        // Update the main channelId in recruitment record to null as the processing channel is gone.
+                        // ticketChannelId will hold the new active application channel.
+                        await recruitmentCollection.updateOne(
+                            { userId: userId },
+                            { $set: { channelId: null } } // Set the old processing channelId to null
+                        );
+                         console.log(`[onInteractionCreate] Set main channelId to null for user ${member.user.tag} after deleting processing channel.`);
+
+                    } catch (deleteError) {
+                        console.error(`[onInteractionCreate] Failed to delete original processing channel #${interaction.channel.name}:`, deleteError);
+                        await notifyStaff(guild, `Failed to delete processing channel ${interaction.channel.name} for ${member.user.tag} after ticket creation. Please review. Error: ${deleteError.message}`, "PROCESSING_CHANNEL_DELETE_ERROR");
+                    }
+                } else {
+                    console.warn(`[onInteractionCreate] Did not delete channel ${interaction.channel.name} as it does not appear to be a processing channel.`);
+                }
 
 
             } catch (error) {
