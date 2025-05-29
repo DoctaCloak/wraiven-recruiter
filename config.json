@@ -19,6 +19,14 @@
   "LLM": {
     "PROMPT_GUILD_NAME": "Wraiven" 
   },
+  "GUILD_INFO": {
+    "ALLIANCE": "LEMUR",
+    "TAX_RATE_PERCENT": 0,
+    "PRIMARY_ACTIVITIES": "Small-scale PvP, precision bombing, tactical ganking, economic control",
+    "PLAYER_DEVELOPMENT_INFO": "Intensive training regimen, willing to train players",
+    "LOOT_SYSTEM": "Lootsplit System",
+    "ACTIVE_TIMEFRAME_UTC": "21:00-05:00"
+  },
   "ACCOUNT_RESTRICTIONS": {
     "MIN_ACCOUNT_AGE_DAYS": 14
   },
