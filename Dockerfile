@@ -22,4 +22,4 @@ COPY . .
 
 # Command to run the application
 # Replace main.js with your actual main script file, or use 'npm start'
-CMD [ "npm", "run", "register", "&&", "node", "app.js" ] 
+CMD [ "npm", "run", "register", "&&", "nodemon", "app.js" ] 
